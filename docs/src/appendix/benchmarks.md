@@ -111,6 +111,77 @@ This generates `docs/src/appendix/benchmarks.html` with interactive tables and d
 
 ---
 
+## PyTorch CPU Reference Comparison
+
+Comparison with PyTorch 2.8.0 CPU (with MKL/BLAS) on the same hardware.
+
+### Matrix Multiplication (512x512x512)
+
+| Implementation | Threads | Time | Throughput |
+|----------------|---------|------|------------|
+| PyTorch | 1 | 2.44 ms | 110 G/s |
+| PyTorch | 24 | 300 μs | 894 G/s |
+| Tenzor tiled | 1 | 6.2 ms | 43 G/s |
+| Tenzor parallel | 8 | 3.6 ms | 75 G/s |
+
+**Notes**: PyTorch uses Intel MKL which has highly optimized BLAS routines. Tenzor's pure-Zig implementation is ~2.5x slower single-threaded.
+
+### LeNet-5 Forward Pass
+
+| Implementation | Batch | Time | Images/sec |
+|----------------|-------|------|------------|
+| PyTorch | 1 | 81 μs | 12.3K |
+| PyTorch | 64 | 1.46 ms | 44K |
+| PyTorch (24 threads) | 1 | 1.0 ms | 1.0K |
+| PyTorch (24 threads) | 64 | 436 μs | 147K |
+| Tenzor | 1 | 443 μs | 2.3K |
+| Tenzor | 64 | 4.5 ms | 14K |
+
+**Notes**: Tenzor is 5.5x slower than single-threaded PyTorch for batch=1, but 2.8x faster than 24-thread PyTorch at batch=1 (threading overhead). For larger batches, PyTorch's parallelism wins.
+
+### Elementwise (1M elements)
+
+| Operation | PyTorch (1 thread) | PyTorch (24 threads) | Tenzor |
+|-----------|-------------------|----------------------|--------|
+| ReLU | 118 μs | 25 μs | 330 μs |
+| exp | 173 μs | 37 μs | 3.7 ms |
+| tanh | 1.07 ms | 146 μs | 4.5 ms |
+| add | 159 μs | 26 μs | 490 μs |
+
+**Notes**: PyTorch uses vectorized intrinsics from MKL-VML for transcendentals. Tenzor uses pure SIMD without external dependencies.
+
+### Softmax (256x256)
+
+| Implementation | Time | Throughput |
+|----------------|------|------------|
+| PyTorch (1 thread) | 35 μs | 9.5 G/s |
+| PyTorch (24 threads) | 13 μs | 25 G/s |
+| Tenzor | 321 μs | 989 M/s |
+
+### Key Takeaways
+
+1. **PyTorch wins on raw compute**: MKL/BLAS gives 2-10x speedup for matrix ops
+2. **Tenzor wins on simplicity**: No external dependencies, single binary, ~150KB
+3. **Threading overhead**: PyTorch's 24-thread overhead hurts small batch sizes
+4. **Compilation**: Tenzor compiles in <1s; PyTorch has Python startup overhead
+
+### When to Use Tenzor
+
+- Embedded/edge deployment (no Python, no MKL dependency)
+- WebAssembly targets
+- Real-time applications where startup latency matters
+- Learning/educational purposes (readable pure-Zig implementation)
+- Scenarios where single-digit millisecond latency is acceptable
+
+### When to Use PyTorch
+
+- Maximum throughput is critical
+- Large batch training/inference
+- GPU acceleration needed
+- Ecosystem (pretrained models, tooling)
+
+---
+
 ## Methodology
 
 - **Warmup**: 50ms warmup phase to stabilize CPU frequency
