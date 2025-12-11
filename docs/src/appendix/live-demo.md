@@ -5,6 +5,7 @@ Draw a digit below and watch Tenzor recognize it in real-time. This runs entirel
 <div id="demo-container" style="text-align: center; margin: 2em 0;">
   <canvas id="canvas" width="280" height="280" style="border: 2px solid #333; border-radius: 8px; cursor: crosshair; touch-action: none;"></canvas>
   <div style="margin-top: 1em;">
+    <button id="predict-btn" style="padding: 0.5em 1.5em; font-size: 1.1em; cursor: pointer; background: #4a4; color: white; border: none; border-radius: 4px; margin-right: 0.5em;">Predict</button>
     <button id="clear-btn" style="padding: 0.5em 1.5em; font-size: 1em; cursor: pointer;">Clear</button>
   </div>
   <div id="result" style="margin-top: 1em; font-size: 2em; font-weight: bold;">
@@ -22,6 +23,7 @@ Draw a digit below and watch Tenzor recognize it in real-time. This runs entirel
   const confidence = document.getElementById('confidence');
   const status = document.getElementById('status');
   const clearBtn = document.getElementById('clear-btn');
+  const predictBtn = document.getElementById('predict-btn');
 
   let wasm = null;
   let inputPtr = null;
@@ -109,7 +111,6 @@ Draw a digit below and watch Tenzor recognize it in real-time. This runs entirel
   function endDraw(e) {
     if (!isDrawing) return;
     isDrawing = false;
-    predict();
   }
 
   // Mouse events
@@ -130,6 +131,9 @@ Draw a digit below and watch Tenzor recognize it in real-time. This runs entirel
     result.textContent = 'Draw a digit (0-9)';
     confidence.textContent = '';
   });
+
+  // Predict button
+  predictBtn.addEventListener('click', predict);
 
   // Run prediction
   function predict() {
