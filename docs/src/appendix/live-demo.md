@@ -163,7 +163,7 @@ Draw a digit below and watch Tenzor recognize it in real-time. This runs entirel
     for (let y = 0; y < 280; y++) {
       for (let x = 0; x < 280; x++) {
         const idx = (y * 280 + x) * 4;
-        if (imageData.data[idx] > 10) { // Non-black pixel
+        if (imageData.data[idx] > 10) {
           minX = Math.min(minX, x);
           minY = Math.min(minY, y);
           maxX = Math.max(maxX, x);
@@ -179,37 +179,44 @@ Draw a digit below and watch Tenzor recognize it in real-time. This runs entirel
       return;
     }
 
-    // Calculate center and size of digit
-    const digitW = maxX - minX;
-    const digitH = maxY - minY;
-    const digitSize = Math.max(digitW, digitH);
-    const centerX = (minX + maxX) / 2;
-    const centerY = (minY + maxY) / 2;
+    // Add padding around bounding box
+    const pad = 20;
+    minX = Math.max(0, minX - pad);
+    minY = Math.max(0, minY - pad);
+    maxX = Math.min(279, maxX + pad);
+    maxY = Math.min(279, maxY + pad);
 
-    // Scale to fit in 20x20 area (with 4px padding on each side for 28x28)
-    const scale = 200 / digitSize; // Target 20px in 28px space = ~200px in 280px space
+    // Make it square (use larger dimension)
+    const w = maxX - minX;
+    const h = maxY - minY;
+    const size = Math.max(w, h);
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
 
-    // Downsample with centering
+    // New square bounding box centered on digit
+    const left = Math.max(0, Math.floor(cx - size / 2));
+    const top = Math.max(0, Math.floor(cy - size / 2));
+
+    // Sample from square region into 28x28
     const input = new Float32Array(28 * 28);
+    const step = size / 28;
+
     for (let y = 0; y < 28; y++) {
       for (let x = 0; x < 28; x++) {
-        // Map output pixel to input, centered
-        const srcX = (x - 14) * (10 / scale) + centerX;
-        const srcY = (y - 14) * (10 / scale) + centerY;
-
-        // Sample with averaging
         let sum = 0;
         let count = 0;
-        const sampleSize = Math.max(1, Math.floor(10 / scale));
-        for (let dy = 0; dy < sampleSize; dy++) {
-          for (let dx = 0; dx < sampleSize; dx++) {
-            const px = Math.floor(srcX + dx - sampleSize/2);
-            const py = Math.floor(srcY + dy - sampleSize/2);
-            if (px >= 0 && px < 280 && py >= 0 && py < 280) {
-              const idx = (py * 280 + px) * 4;
-              sum += imageData.data[idx];
-              count++;
-            }
+
+        // Average pixels in this cell
+        const startY = Math.floor(top + y * step);
+        const endY = Math.floor(top + (y + 1) * step);
+        const startX = Math.floor(left + x * step);
+        const endX = Math.floor(left + (x + 1) * step);
+
+        for (let py = startY; py < endY && py < 280; py++) {
+          for (let px = startX; px < endX && px < 280; px++) {
+            const idx = (py * 280 + px) * 4;
+            sum += imageData.data[idx];
+            count++;
           }
         }
         input[y * 28 + x] = count > 0 ? sum / (count * 255) : 0;
