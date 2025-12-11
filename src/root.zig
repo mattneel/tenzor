@@ -39,6 +39,8 @@ pub const backend = struct {
 // I/O and file formats
 pub const io = struct {
     pub const safetensors = @import("io/safetensors.zig");
+    pub const tenzor_format = @import("io/tenzor_format.zig");
+    pub const huggingface = @import("io/huggingface.zig");
     pub const mnist = @import("io/mnist.zig");
     pub const tokenizer = @import("io/tokenizer.zig");
 };
@@ -54,6 +56,8 @@ pub const nn = struct {
     pub const loss = @import("nn/loss.zig");
     pub const optim = @import("nn/optim.zig");
     pub const init = @import("nn/init.zig");
+    pub const checkpoint = @import("nn/checkpoint.zig");
+    pub const scheduler = @import("nn/scheduler.zig");
 };
 
 // Fusion engine
@@ -70,6 +74,32 @@ pub const memory = struct {
     pub const TensorAllocator = allocator_mod.TensorAllocator;
     pub const ComputeArena = allocator_mod.ComputeArena;
     pub const BufferPool = pool.BufferPool;
+};
+
+// TUI dashboard
+pub const tui = struct {
+    pub const terminal = @import("tui/terminal.zig");
+    pub const widgets = @import("tui/widgets.zig");
+    pub const dashboard = @import("tui/dashboard.zig");
+    pub const Terminal = terminal.Terminal;
+    pub const Dashboard = dashboard.Dashboard;
+    pub const TrainerState = dashboard.TrainerState;
+};
+
+// Training infrastructure
+pub const training = struct {
+    pub const metrics = @import("training/metrics.zig");
+    pub const callbacks = @import("training/callbacks.zig");
+    pub const trainer = @import("training/trainer.zig");
+    pub const MetricsLogger = metrics.MetricsLogger;
+    pub const MetricsHistory = metrics.MetricsHistory;
+    pub const BatchMetrics = metrics.BatchMetrics;
+    pub const EpochMetrics = metrics.EpochMetrics;
+    pub const EarlyStopping = callbacks.EarlyStopping;
+    pub const ModelCheckpoint = callbacks.ModelCheckpoint;
+    pub const Callback = callbacks.Callback;
+    pub const Trainer = trainer.Trainer;
+    pub const TrainerConfig = trainer.TrainerConfig;
 };
 
 // Re-export commonly used types at top level
@@ -119,6 +149,8 @@ test {
 
     // I/O tests
     _ = io.safetensors;
+    _ = io.tenzor_format;
+    _ = io.huggingface;
     _ = io.mnist;
     _ = io.tokenizer;
 
@@ -130,6 +162,8 @@ test {
     _ = nn.loss;
     _ = nn.optim;
     _ = nn.init;
+    _ = nn.checkpoint;
+    _ = nn.scheduler;
 
     // Integration tests
     _ = @import("tests/arctic_integration_test.zig");
@@ -144,6 +178,16 @@ test {
     // Memory tests
     _ = memory.allocator_mod;
     _ = memory.pool;
+
+    // TUI tests
+    _ = tui.terminal;
+    _ = tui.widgets;
+    _ = tui.dashboard;
+
+    // Training tests
+    _ = training.metrics;
+    _ = training.callbacks;
+    _ = training.trainer;
 }
 
 // ============================================================================

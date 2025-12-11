@@ -113,6 +113,94 @@ pub const Tokenizer = struct {
         return pos;
     }
 
+    /// Tokenize text into token IDs WITHOUT [CLS]/[SEP] markers.
+    /// Useful for chunking long documents where markers are added per-chunk.
+    pub fn encodeRaw(
+        self: *const Tokenizer,
+        text: []const u8,
+        output: *std.ArrayList(u32),
+        ally: std.mem.Allocator,
+    ) !void {
+        var i: usize = 0;
+        while (i < text.len) {
+            // Skip whitespace
+            while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+            if (i >= text.len) break;
+
+            // Find word boundary
+            const word_start = i;
+            while (i < text.len and !isWhitespace(text[i]) and !isPunctuation(text[i])) : (i += 1) {}
+
+            if (i > word_start) {
+                // Tokenize word into ArrayList
+                try self.tokenizeWordAppend(text[word_start..i], output, ally);
+            }
+
+            // Handle punctuation as separate token
+            if (i < text.len and isPunctuation(text[i])) {
+                const punct = text[i .. i + 1];
+                try output.append(ally, self.vocab.get(punct) orelse self.unk_id);
+                i += 1;
+            }
+        }
+    }
+
+    /// WordPiece tokenization appending to ArrayList.
+    fn tokenizeWordAppend(
+        self: *const Tokenizer,
+        word: []const u8,
+        output: *std.ArrayList(u32),
+        ally: std.mem.Allocator,
+    ) !void {
+        if (word.len > self.max_word_chars) {
+            try output.append(ally, self.unk_id);
+            return;
+        }
+
+        // Lowercase buffer
+        var lower_buf: [256]u8 = undefined;
+        const lower = toLower(word, &lower_buf);
+
+        const start_len = output.items.len;
+        var char_start: usize = 0;
+        var is_first = true;
+
+        while (char_start < lower.len) {
+            var char_end = lower.len;
+            var found = false;
+
+            // Try to find longest matching subword
+            while (char_end > char_start) {
+                var subword_buf: [256]u8 = undefined;
+                const subword = if (is_first)
+                    lower[char_start..char_end]
+                else blk: {
+                    subword_buf[0] = '#';
+                    subword_buf[1] = '#';
+                    @memcpy(subword_buf[2 .. 2 + (char_end - char_start)], lower[char_start..char_end]);
+                    break :blk subword_buf[0 .. 2 + (char_end - char_start)];
+                };
+
+                if (self.vocab.get(subword)) |token_id| {
+                    try output.append(ally, token_id);
+                    char_start = char_end;
+                    is_first = false;
+                    found = true;
+                    break;
+                }
+
+                char_end -= 1;
+            }
+
+            if (!found) {
+                // No subword found, use [UNK] for entire word
+                output.shrinkRetainingCapacity(start_len);
+                try output.append(ally, self.unk_id);
+                return;
+            }
+        }
+    }
+
     /// WordPiece tokenization for a single word.
     fn tokenizeWord(
         self: *const Tokenizer,
