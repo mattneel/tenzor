@@ -16,6 +16,7 @@ const kernels = struct {
     const reduce = @import("kernels/reduce.zig");
     const softmax = @import("kernels/softmax.zig");
     const layernorm = @import("kernels/layernorm.zig");
+    const gather = @import("kernels/gather.zig");
 };
 
 const Tensor = core.tensor.Tensor;
@@ -77,6 +78,9 @@ pub fn evalInto(
         },
         .layernorm => {
             try evalLayerNorm(Expr, expr, output, allocator);
+        },
+        .gather => {
+            try evalGather(Expr, expr, output, allocator);
         },
         else => {
             @compileError("Unsupported expression kind: " ++ @tagName(Expr.kind));
@@ -411,6 +415,61 @@ fn evalLayerNorm(
         Expr.norm_dims,
         kernels.layernorm.default_eps,
     );
+}
+
+/// Evaluate a gather/embedding lookup expression.
+fn evalGather(
+    comptime Expr: type,
+    expr: Expr,
+    output: []Expr.ElementType,
+    allocator: std.mem.Allocator,
+) !void {
+    const T = Expr.ElementType;
+    const IndexT = Expr.IndexType;
+    const Table = Expr.TableType;
+    const Indices = Expr.IndicesType;
+
+    // Get table data (floats)
+    const table_data = try getInputData(Table, expr.table, allocator);
+    defer if (table_data.allocated) allocator.free(table_data.data);
+
+    // Get indices data (integers) - need separate handling
+    const indices_data = try getIndicesData(Indices, IndexT, expr.indices, allocator);
+    defer if (indices_data.allocated) allocator.free(indices_data.data);
+
+    // Call gather kernel
+    kernels.gather.gather(
+        T,
+        IndexT,
+        table_data.data,
+        indices_data.data,
+        output,
+        Expr.vocab_size,
+        Expr.embedding_dim,
+    );
+}
+
+/// Get indices data (integer type), separate from getInputData which assumes float.
+fn getIndicesData(
+    comptime Indices: type,
+    comptime IndexT: type,
+    indices: Indices,
+    allocator: std.mem.Allocator,
+) !InputData(IndexT) {
+    switch (Indices.kind) {
+        .tensor => {
+            return .{ .data = indices.constSlice(), .allocated = false };
+        },
+        else => {
+            // Need to evaluate the expression
+            const numel = computeNumel(Indices.shape);
+            const data = try allocator.alloc(IndexT, numel);
+            errdefer allocator.free(data);
+            // Note: This assumes indices come from tensors, not computed expressions
+            // For now, we only support tensor indices
+            @compileError("Gather indices must be tensor type, not computed expression");
+        },
+    }
 }
 
 /// Result of getting input data - tracks whether we allocated.
@@ -942,5 +1001,144 @@ test "eval layernorm chained" {
 
     for (result.slice(), ln_only.slice()) |r, l| {
         try std.testing.expectApproxEqAbs(r, l, 1e-5);
+    }
+}
+
+test "eval gather basic" {
+    // vocab_size=4, embed_dim=3
+    const Table = Tensor(f32, .{ 4, 3 });
+    const Indices = Tensor(u32, .{3});
+
+    var table = try Table.fromSlice(std.testing.allocator, &[_]f32{
+        1, 2, 3, // entry 0
+        4, 5, 6, // entry 1
+        7, 8, 9, // entry 2
+        10, 11, 12, // entry 3
+    });
+    defer table.deinit();
+
+    var indices = try Indices.fromSlice(std.testing.allocator, &[_]u32{ 0, 2, 1 });
+    defer indices.deinit();
+
+    const GatherExpr = ops.GatherExpr(Table, Indices);
+    const expr = GatherExpr.init(table, indices);
+
+    // Output should be [3, 3]
+    try std.testing.expectEqual(@as(usize, 2), GatherExpr.ndim);
+    try std.testing.expectEqual(@as(usize, 3), GatherExpr.shape[0]);
+    try std.testing.expectEqual(@as(usize, 3), GatherExpr.shape[1]);
+
+    var result = try eval(GatherExpr, expr, std.testing.allocator);
+    defer result.deinit();
+
+    // Entry 0
+    try std.testing.expectEqual(@as(f32, 1), result.slice()[0]);
+    try std.testing.expectEqual(@as(f32, 2), result.slice()[1]);
+    try std.testing.expectEqual(@as(f32, 3), result.slice()[2]);
+
+    // Entry 2
+    try std.testing.expectEqual(@as(f32, 7), result.slice()[3]);
+    try std.testing.expectEqual(@as(f32, 8), result.slice()[4]);
+    try std.testing.expectEqual(@as(f32, 9), result.slice()[5]);
+
+    // Entry 1
+    try std.testing.expectEqual(@as(f32, 4), result.slice()[6]);
+    try std.testing.expectEqual(@as(f32, 5), result.slice()[7]);
+    try std.testing.expectEqual(@as(f32, 6), result.slice()[8]);
+}
+
+test "eval gather 2D indices (batch)" {
+    // vocab_size=10, embed_dim=4, batch=2, seq_len=3
+    const Table = Tensor(f32, .{ 10, 4 });
+    const Indices = Tensor(u32, .{ 2, 3 });
+
+    // Table: entry i has value i in all positions
+    var table = try Table.zeros(std.testing.allocator);
+    defer table.deinit();
+    for (0..10) |i| {
+        for (0..4) |j| {
+            table.data[i * 4 + j] = @floatFromInt(i);
+        }
+    }
+
+    var indices = try Indices.fromSlice(std.testing.allocator, &[_]u32{
+        0, 5, 9, // batch 0
+        1, 2, 3, // batch 1
+    });
+    defer indices.deinit();
+
+    const GatherExpr = ops.GatherExpr(Table, Indices);
+    const expr = GatherExpr.init(table, indices);
+
+    // Output should be [2, 3, 4]
+    try std.testing.expectEqual(@as(usize, 3), GatherExpr.ndim);
+    try std.testing.expectEqual(@as(usize, 2), GatherExpr.shape[0]);
+    try std.testing.expectEqual(@as(usize, 3), GatherExpr.shape[1]);
+    try std.testing.expectEqual(@as(usize, 4), GatherExpr.shape[2]);
+
+    var result = try eval(GatherExpr, expr, std.testing.allocator);
+    defer result.deinit();
+
+    // Batch 0, token 0 (index 0)
+    for (0..4) |j| {
+        try std.testing.expectEqual(@as(f32, 0), result.slice()[j]);
+    }
+
+    // Batch 0, token 1 (index 5)
+    for (0..4) |j| {
+        try std.testing.expectEqual(@as(f32, 5), result.slice()[4 + j]);
+    }
+
+    // Batch 0, token 2 (index 9)
+    for (0..4) |j| {
+        try std.testing.expectEqual(@as(f32, 9), result.slice()[8 + j]);
+    }
+
+    // Batch 1, token 0 (index 1)
+    for (0..4) |j| {
+        try std.testing.expectEqual(@as(f32, 1), result.slice()[12 + j]);
+    }
+}
+
+test "eval gather chained with matmul" {
+    // Typical transformer: embedding lookup -> linear projection
+    const Table = Tensor(f32, .{ 10, 4 });
+    const Indices = Tensor(u32, .{2});
+    const Weight = Tensor(f32, .{ 4, 4 });
+
+    var table = try Table.zeros(std.testing.allocator);
+    defer table.deinit();
+    for (0..10) |i| {
+        for (0..4) |j| {
+            table.data[i * 4 + j] = @floatFromInt(i);
+        }
+    }
+
+    var indices = try Indices.fromSlice(std.testing.allocator, &[_]u32{ 1, 2 });
+    defer indices.deinit();
+
+    // Identity weight
+    var weight = try Weight.zeros(std.testing.allocator);
+    defer weight.deinit();
+    for (0..4) |i| {
+        weight.data[i * 4 + i] = 1.0;
+    }
+
+    // gather(table, indices) @ weight
+    const GatherExpr = ops.GatherExpr(Table, Indices);
+    const MatmulExpr = ops.MatmulExpr(GatherExpr, Weight);
+
+    const gather_expr = GatherExpr.init(table, indices);
+    const mm = gather_expr.matmul(weight);
+
+    var result = try eval(MatmulExpr, mm, std.testing.allocator);
+    defer result.deinit();
+
+    // With identity weight, output should equal gather output
+    var gather_only = try eval(GatherExpr, gather_expr, std.testing.allocator);
+    defer gather_only.deinit();
+
+    for (result.slice(), gather_only.slice()) |r, g| {
+        try std.testing.expectApproxEqAbs(r, g, 1e-5);
     }
 }

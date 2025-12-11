@@ -145,6 +145,7 @@ pub const NodeKind = enum {
     transpose, // Axis permutation
     softmax, // Softmax normalization
     layernorm, // Layer normalization
+    gather, // Gather/embedding lookup
 };
 
 /// Marker trait to identify expression types.
@@ -766,6 +767,81 @@ pub fn LayerNormExpr(
 
         pub fn add(self: Self, other: anytype) BinaryExpr(.add, Self, AsExpr(@TypeOf(other))) {
             return BinaryExpr(.add, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
+        }
+
+        pub fn softmax(self: Self, comptime axis: isize) SoftmaxExpr(Self, axis) {
+            return SoftmaxExpr(Self, axis).init(self);
+        }
+    };
+}
+
+/// Gather/embedding lookup expression type.
+/// Looks up embeddings from a table using indices.
+/// table: [vocab_size, embed_dim], indices: [..., seq_len] -> output: [..., seq_len, embed_dim]
+pub fn GatherExpr(comptime Table: type, comptime Indices: type) type {
+    comptime {
+        // Table must be 2D: [vocab_size, embed_dim]
+        if (RankOf(Table) != 2) {
+            @compileError(std.fmt.comptimePrint(
+                "Gather table must be 2D [vocab, embed], got {d}D",
+                .{RankOf(Table)},
+            ));
+        }
+
+        // Indices must be integer type
+        const idx_elem = ElementTypeOf(Indices);
+        if (@typeInfo(idx_elem) != .int) {
+            @compileError("Gather indices must be integer type, got " ++ @typeName(idx_elem));
+        }
+    }
+
+    const table_shape = ShapeOf(Table);
+    const indices_shape = ShapeOf(Indices);
+    const embed_dim = table_shape[1];
+
+    // Output shape: indices_shape ++ [embed_dim]
+    const out_ndim = RankOf(Indices) + 1;
+    const out_shape: [out_ndim]usize = blk: {
+        var s: [out_ndim]usize = undefined;
+        for (0..RankOf(Indices)) |i| {
+            s[i] = indices_shape[i];
+        }
+        s[out_ndim - 1] = embed_dim;
+        break :blk s;
+    };
+
+    return struct {
+        pub const ExpressionMarker = true;
+        pub const kind: NodeKind = .gather;
+        pub const TableType = Table;
+        pub const IndicesType = Indices;
+        pub const ElementType = ElementTypeOf(Table);
+        pub const IndexType = ElementTypeOf(Indices);
+        pub const ndim = out_ndim;
+        pub const shape = out_shape;
+        pub const vocab_size = table_shape[0];
+        pub const embedding_dim = embed_dim;
+
+        table: Table,
+        indices: Indices,
+
+        const Self = @This();
+
+        pub fn init(table: Table, indices: Indices) Self {
+            return .{ .table = table, .indices = indices };
+        }
+
+        // Can chain operations after gather
+        pub fn matmul(self: Self, other: anytype) MatmulExpr(Self, @TypeOf(other)) {
+            return MatmulExpr(Self, @TypeOf(other)).init(self, other);
+        }
+
+        pub fn add(self: Self, other: anytype) BinaryExpr(.add, Self, AsExpr(@TypeOf(other))) {
+            return BinaryExpr(.add, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
+        }
+
+        pub fn mul(self: Self, other: anytype) BinaryExpr(.mul, Self, AsExpr(@TypeOf(other))) {
+            return BinaryExpr(.mul, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
         }
 
         pub fn softmax(self: Self, comptime axis: isize) SoftmaxExpr(Self, axis) {
