@@ -30,6 +30,8 @@ pub const backend = struct {
             pub const layernorm = @import("backend/cpu/kernels/layernorm.zig");
             pub const gather = @import("backend/cpu/kernels/gather.zig");
             pub const transpose = @import("backend/cpu/kernels/transpose.zig");
+            pub const conv2d = @import("backend/cpu/kernels/conv2d.zig");
+            pub const maxpool = @import("backend/cpu/kernels/maxpool.zig");
         };
     };
 };
@@ -37,11 +39,20 @@ pub const backend = struct {
 // I/O and file formats
 pub const io = struct {
     pub const safetensors = @import("io/safetensors.zig");
+    pub const mnist = @import("io/mnist.zig");
 };
 
 // Model implementations
 pub const model = struct {
     pub const arctic = @import("model/arctic.zig");
+    pub const lenet = @import("model/lenet.zig");
+};
+
+// Neural network training utilities
+pub const nn = struct {
+    pub const loss = @import("nn/loss.zig");
+    pub const optim = @import("nn/optim.zig");
+    pub const init = @import("nn/init.zig");
 };
 
 // Fusion engine
@@ -102,15 +113,25 @@ test {
     _ = backend.cpu.kernels.layernorm;
     _ = backend.cpu.kernels.gather;
     _ = backend.cpu.kernels.transpose;
+    _ = backend.cpu.kernels.conv2d;
+    _ = backend.cpu.kernels.maxpool;
 
     // I/O tests
     _ = io.safetensors;
+    _ = io.mnist;
 
     // Model tests
     _ = model.arctic;
+    _ = model.lenet;
+
+    // Neural network training tests
+    _ = nn.loss;
+    _ = nn.optim;
+    _ = nn.init;
 
     // Integration tests
     _ = @import("tests/arctic_integration_test.zig");
+    _ = @import("tests/lenet_test.zig");
 
     // Fusion tests
     _ = fusion.analyzer;
