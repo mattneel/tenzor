@@ -15,6 +15,7 @@ const kernels = struct {
     const matmul = @import("kernels/matmul.zig");
     const reduce = @import("kernels/reduce.zig");
     const softmax = @import("kernels/softmax.zig");
+    const layernorm = @import("kernels/layernorm.zig");
 };
 
 const Tensor = core.tensor.Tensor;
@@ -73,6 +74,9 @@ pub fn evalInto(
         },
         .softmax => {
             try evalSoftmax(Expr, expr, output, allocator);
+        },
+        .layernorm => {
+            try evalLayerNorm(Expr, expr, output, allocator);
         },
         else => {
             @compileError("Unsupported expression kind: " ++ @tagName(Expr.kind));
@@ -370,6 +374,42 @@ fn evalSoftmax(
         Expr.shape,
         Expr.softmax_axis,
         null, // No mask for now
+    );
+}
+
+/// Evaluate a layer normalization expression.
+fn evalLayerNorm(
+    comptime Expr: type,
+    expr: Expr,
+    output: []Expr.ElementType,
+    allocator: std.mem.Allocator,
+) !void {
+    const T = Expr.ElementType;
+    const Input = Expr.InputType;
+    const Gamma = Expr.GammaType;
+    const Beta = Expr.BetaType;
+
+    // Get input data
+    const input_data = try getInputData(Input, expr.input, allocator);
+    defer if (input_data.allocated) allocator.free(input_data.data);
+
+    const gamma_data = try getInputData(Gamma, expr.gamma, allocator);
+    defer if (gamma_data.allocated) allocator.free(gamma_data.data);
+
+    const beta_data = try getInputData(Beta, expr.beta, allocator);
+    defer if (beta_data.allocated) allocator.free(beta_data.data);
+
+    // Call layernorm kernel
+    kernels.layernorm.layerNorm(
+        T,
+        input_data.data,
+        gamma_data.data,
+        beta_data.data,
+        output,
+        Expr.ndim,
+        Expr.shape,
+        Expr.norm_dims,
+        kernels.layernorm.default_eps,
     );
 }
 
@@ -799,4 +839,108 @@ test "eval softmax chained after matmul" {
 
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), row0_sum, 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), row1_sum, 1e-5);
+}
+
+test "eval layernorm 1D" {
+    const Vec = Tensor(f32, .{4});
+    var input = try Vec.fromSlice(std.testing.allocator, &[_]f32{ 1, 2, 3, 4 });
+    defer input.deinit();
+    var gamma = try Vec.fromSlice(std.testing.allocator, &[_]f32{ 1, 1, 1, 1 });
+    defer gamma.deinit();
+    var beta = try Vec.fromSlice(std.testing.allocator, &[_]f32{ 0, 0, 0, 0 });
+    defer beta.deinit();
+
+    const LNExpr = ops.LayerNormExpr(Vec, Vec, Vec, 1);
+    const expr = LNExpr.init(input, gamma, beta);
+
+    var result = try eval(LNExpr, expr, std.testing.allocator);
+    defer result.deinit();
+
+    // After normalization with gamma=1, beta=0: mean should be ~0
+    var mean: f32 = 0;
+    for (result.slice()) |v| mean += v;
+    mean /= 4;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mean, 1e-5);
+}
+
+test "eval layernorm 2D transformer pattern" {
+    // [B=1, S=2, D=4] -> normalize over D
+    const Input = Tensor(f32, .{ 2, 4 });
+    const Params = Tensor(f32, .{4});
+
+    var input = try Input.fromSlice(std.testing.allocator, &[_]f32{
+        1, 2, 3, 4, // token 0
+        10, 20, 30, 40, // token 1 (scaled)
+    });
+    defer input.deinit();
+
+    var gamma = try Params.fromSlice(std.testing.allocator, &[_]f32{ 1, 1, 1, 1 });
+    defer gamma.deinit();
+    var beta = try Params.fromSlice(std.testing.allocator, &[_]f32{ 0, 0, 0, 0 });
+    defer beta.deinit();
+
+    const LNExpr = ops.LayerNormExpr(Input, Params, Params, 1);
+    const expr = LNExpr.init(input, gamma, beta);
+
+    var result = try eval(LNExpr, expr, std.testing.allocator);
+    defer result.deinit();
+
+    // Each token should have mean ~0
+    var mean0: f32 = 0;
+    var mean1: f32 = 0;
+    for (result.slice()[0..4]) |v| mean0 += v;
+    for (result.slice()[4..8]) |v| mean1 += v;
+    mean0 /= 4;
+    mean1 /= 4;
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mean0, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mean1, 1e-5);
+
+    // Normalized values should be the same (same relative pattern)
+    for (0..4) |i| {
+        try std.testing.expectApproxEqAbs(result.slice()[i], result.slice()[4 + i], 1e-5);
+    }
+}
+
+test "eval layernorm chained" {
+    // Common pattern: layernorm -> matmul
+    const Input = Tensor(f32, .{ 2, 4 });
+    const Params = Tensor(f32, .{4});
+    const Weight = Tensor(f32, .{ 4, 4 });
+
+    var input = try Input.fromSlice(std.testing.allocator, &[_]f32{
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+    });
+    defer input.deinit();
+
+    var gamma = try Params.ones(std.testing.allocator);
+    defer gamma.deinit();
+    var beta = try Params.zeros(std.testing.allocator);
+    defer beta.deinit();
+
+    // Identity weight
+    var weight = try Weight.zeros(std.testing.allocator);
+    defer weight.deinit();
+    for (0..4) |i| {
+        weight.data[i * 4 + i] = 1.0;
+    }
+
+    // layernorm(input) @ weight
+    const LNExpr = ops.LayerNormExpr(Input, Params, Params, 1);
+    const MatmulExpr = ops.MatmulExpr(LNExpr, Weight);
+
+    const ln = LNExpr.init(input, gamma, beta);
+    const mm = ln.matmul(weight);
+
+    var result = try eval(MatmulExpr, mm, std.testing.allocator);
+    defer result.deinit();
+
+    // With identity weight, result should equal layernorm output
+    var ln_only = try eval(LNExpr, ln, std.testing.allocator);
+    defer ln_only.deinit();
+
+    for (result.slice(), ln_only.slice()) |r, l| {
+        try std.testing.expectApproxEqAbs(r, l, 1e-5);
+    }
 }

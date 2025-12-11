@@ -144,6 +144,7 @@ pub const NodeKind = enum {
     reshape, // Shape manipulation
     transpose, // Axis permutation
     softmax, // Softmax normalization
+    layernorm, // Layer normalization
 };
 
 /// Marker trait to identify expression types.
@@ -692,6 +693,83 @@ pub fn SoftmaxExpr(comptime Input: type, comptime axis: isize) type {
 
         pub fn add(self: Self, other: anytype) BinaryExpr(.add, Self, AsExpr(@TypeOf(other))) {
             return BinaryExpr(.add, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
+        }
+    };
+}
+
+/// Layer normalization expression type.
+/// Computes: (x - mean) / sqrt(var + eps) * gamma + beta
+/// Applied over the last `normalized_dims` dimensions.
+/// For transformer: input [B, S, D], gamma [D], beta [D], normalized_dims=1
+pub fn LayerNormExpr(
+    comptime Input: type,
+    comptime Gamma: type,
+    comptime Beta: type,
+    comptime normalized_dims: usize,
+) type {
+    comptime {
+        // Type check
+        if (ElementTypeOf(Input) != ElementTypeOf(Gamma) or ElementTypeOf(Input) != ElementTypeOf(Beta)) {
+            @compileError("Type mismatch in layernorm");
+        }
+
+        // Shape check: gamma and beta should match the last `normalized_dims` of input
+        const input_shape = ShapeOf(Input);
+        const gamma_shape = ShapeOf(Gamma);
+        const beta_shape = ShapeOf(Beta);
+
+        if (RankOf(Gamma) != normalized_dims or RankOf(Beta) != normalized_dims) {
+            @compileError(std.fmt.comptimePrint(
+                "Gamma/beta rank must equal normalized_dims. Got gamma={d}, beta={d}, normalized_dims={d}",
+                .{ RankOf(Gamma), RankOf(Beta), normalized_dims },
+            ));
+        }
+
+        // Check dimensions match
+        for (0..normalized_dims) |i| {
+            const input_dim = input_shape[RankOf(Input) - normalized_dims + i];
+            if (gamma_shape[i] != input_dim or beta_shape[i] != input_dim) {
+                @compileError("Gamma/beta shape must match last dimensions of input");
+            }
+        }
+    }
+
+    return struct {
+        pub const ExpressionMarker = true;
+        pub const kind: NodeKind = .layernorm;
+        pub const InputType = Input;
+        pub const GammaType = Gamma;
+        pub const BetaType = Beta;
+        pub const ElementType = ElementTypeOf(Input);
+        pub const ndim = RankOf(Input);
+        pub const shape = ShapeOf(Input);
+        pub const norm_dims: usize = normalized_dims;
+
+        input: Input,
+        gamma: Gamma,
+        beta: Beta,
+
+        const Self = @This();
+
+        pub fn init(input: Input, gamma: Gamma, beta: Beta) Self {
+            return .{ .input = input, .gamma = gamma, .beta = beta };
+        }
+
+        // Can chain operations after layernorm
+        pub fn matmul(self: Self, other: anytype) MatmulExpr(Self, @TypeOf(other)) {
+            return MatmulExpr(Self, @TypeOf(other)).init(self, other);
+        }
+
+        pub fn mul(self: Self, other: anytype) BinaryExpr(.mul, Self, AsExpr(@TypeOf(other))) {
+            return BinaryExpr(.mul, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
+        }
+
+        pub fn add(self: Self, other: anytype) BinaryExpr(.add, Self, AsExpr(@TypeOf(other))) {
+            return BinaryExpr(.add, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
+        }
+
+        pub fn softmax(self: Self, comptime axis: isize) SoftmaxExpr(Self, axis) {
+            return SoftmaxExpr(Self, axis).init(self);
         }
     };
 }
