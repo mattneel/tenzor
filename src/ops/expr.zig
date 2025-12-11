@@ -143,6 +143,7 @@ pub const NodeKind = enum {
     reduce, // Reduction
     reshape, // Shape manipulation
     transpose, // Axis permutation
+    softmax, // Softmax normalization
 };
 
 /// Marker trait to identify expression types.
@@ -337,6 +338,11 @@ pub fn UnaryExpr(comptime op: OpTag, comptime Input: type) type {
         pub fn reduceMin(self: Self) ReduceExpr(.reduce_min, Self, .{}, false) {
             return ReduceExpr(.reduce_min, Self, .{}, false).init(self);
         }
+
+        // Softmax (default axis=-1)
+        pub fn softmax(self: Self, comptime axis: isize) SoftmaxExpr(Self, axis) {
+            return SoftmaxExpr(Self, axis).init(self);
+        }
     };
 }
 
@@ -495,6 +501,11 @@ pub fn BinaryExpr(comptime op: OpTag, comptime Lhs: type, comptime Rhs: type) ty
         pub fn reduceMin(self: Self) ReduceExpr(.reduce_min, Self, .{}, false) {
             return ReduceExpr(.reduce_min, Self, .{}, false).init(self);
         }
+
+        // Softmax
+        pub fn softmax(self: Self, comptime axis: isize) SoftmaxExpr(Self, axis) {
+            return SoftmaxExpr(Self, axis).init(self);
+        }
     };
 }
 
@@ -581,6 +592,11 @@ pub fn MatmulExpr(comptime Lhs: type, comptime Rhs: type) type {
         pub fn mean(self: Self) ReduceExpr(.mean, Self, .{}, false) {
             return ReduceExpr(.mean, Self, .{}, false).init(self);
         }
+
+        // Softmax
+        pub fn softmax(self: Self, comptime axis: isize) SoftmaxExpr(Self, axis) {
+            return SoftmaxExpr(Self, axis).init(self);
+        }
     };
 }
 
@@ -633,6 +649,49 @@ pub fn ReduceExpr(
 
         pub fn @"sqrt"(self: Self) UnaryExpr(.sqrt, Self) {
             return UnaryExpr(.sqrt, Self).init(self);
+        }
+
+        // Softmax
+        pub fn softmax(self: Self, comptime axis: isize) SoftmaxExpr(Self, axis) {
+            return SoftmaxExpr(Self, axis).init(self);
+        }
+    };
+}
+
+/// Softmax expression type.
+/// Computes softmax along a specified axis with numerical stability.
+/// softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))
+pub fn SoftmaxExpr(comptime Input: type, comptime axis: isize) type {
+    const normalized_axis = core.shape.normalizeAxis(RankOf(Input), axis);
+
+    return struct {
+        pub const ExpressionMarker = true;
+        pub const kind: NodeKind = .softmax;
+        pub const InputType = Input;
+        pub const ElementType = ElementTypeOf(Input);
+        pub const ndim = RankOf(Input);
+        pub const shape = ShapeOf(Input);
+        pub const softmax_axis: usize = normalized_axis;
+
+        input: Input,
+
+        const Self = @This();
+
+        pub fn init(input: Input) Self {
+            return .{ .input = input };
+        }
+
+        // Can chain operations after softmax
+        pub fn matmul(self: Self, other: anytype) MatmulExpr(Self, @TypeOf(other)) {
+            return MatmulExpr(Self, @TypeOf(other)).init(self, other);
+        }
+
+        pub fn mul(self: Self, other: anytype) BinaryExpr(.mul, Self, AsExpr(@TypeOf(other))) {
+            return BinaryExpr(.mul, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
+        }
+
+        pub fn add(self: Self, other: anytype) BinaryExpr(.add, Self, AsExpr(@TypeOf(other))) {
+            return BinaryExpr(.add, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
         }
     };
 }

@@ -14,6 +14,7 @@ const kernels = struct {
     const elementwise = @import("kernels/elementwise.zig");
     const matmul = @import("kernels/matmul.zig");
     const reduce = @import("kernels/reduce.zig");
+    const softmax = @import("kernels/softmax.zig");
 };
 
 const Tensor = core.tensor.Tensor;
@@ -69,6 +70,9 @@ pub fn evalInto(
         },
         .reduce => {
             try evalReduce(Expr, expr, output, allocator);
+        },
+        .softmax => {
+            try evalSoftmax(Expr, expr, output, allocator);
         },
         else => {
             @compileError("Unsupported expression kind: " ++ @tagName(Expr.kind));
@@ -341,6 +345,32 @@ fn evalReduce(
             Expr.keep_dims,
         );
     }
+}
+
+/// Evaluate a softmax expression.
+fn evalSoftmax(
+    comptime Expr: type,
+    expr: Expr,
+    output: []Expr.ElementType,
+    allocator: std.mem.Allocator,
+) !void {
+    const T = Expr.ElementType;
+    const Input = Expr.InputType;
+
+    // Get input data
+    const input_data = try getInputData(Input, expr.input, allocator);
+    defer if (input_data.allocated) allocator.free(input_data.data);
+
+    // Call softmax kernel with the axis from the expression
+    kernels.softmax.softmaxAxis(
+        T,
+        input_data.data,
+        output,
+        Expr.ndim,
+        Expr.shape,
+        Expr.softmax_axis,
+        null, // No mask for now
+    );
 }
 
 /// Result of getting input data - tracks whether we allocated.
@@ -653,4 +683,120 @@ test "eval batched matmul arctic pattern" {
     for (hidden.slice(), result.slice()) |h, r| {
         try std.testing.expectApproxEqAbs(h, r, 1e-5);
     }
+}
+
+test "eval softmax 1D" {
+    const Vec = Tensor(f32, .{4});
+    var input = try Vec.fromSlice(std.testing.allocator, &[_]f32{ 1, 2, 3, 4 });
+    defer input.deinit();
+
+    const SoftmaxExpr = ops.SoftmaxExpr(Vec, -1);
+    const expr = SoftmaxExpr.init(input);
+
+    var result = try eval(SoftmaxExpr, expr, std.testing.allocator);
+    defer result.deinit();
+
+    // Should sum to 1
+    var sum: f32 = 0;
+    for (result.slice()) |v| sum += v;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-5);
+
+    // Larger inputs should have higher probabilities
+    try std.testing.expect(result.slice()[3] > result.slice()[2]);
+    try std.testing.expect(result.slice()[2] > result.slice()[1]);
+    try std.testing.expect(result.slice()[1] > result.slice()[0]);
+}
+
+test "eval softmax 2D last axis" {
+    const Mat = Tensor(f32, .{ 2, 3 });
+    var input = try Mat.fromSlice(std.testing.allocator, &[_]f32{
+        1, 2, 3, // row 0
+        0, 0, 0, // row 1 (uniform)
+    });
+    defer input.deinit();
+
+    const SoftmaxExpr = ops.SoftmaxExpr(Mat, -1);
+    const expr = SoftmaxExpr.init(input);
+
+    var result = try eval(SoftmaxExpr, expr, std.testing.allocator);
+    defer result.deinit();
+
+    // Each row should sum to 1
+    var row0_sum: f32 = 0;
+    var row1_sum: f32 = 0;
+    for (result.slice()[0..3]) |v| row0_sum += v;
+    for (result.slice()[3..6]) |v| row1_sum += v;
+
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), row0_sum, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), row1_sum, 1e-5);
+
+    // Row 1 should be uniform
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), result.slice()[3], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), result.slice()[4], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), result.slice()[5], 1e-5);
+}
+
+test "eval softmax 4D attention pattern" {
+    // [B=1, H=2, S=2, S=2] - typical attention shape
+    const Attn = Tensor(f32, .{ 1, 2, 2, 2 });
+    var input = try Attn.fromSlice(std.testing.allocator, &[_]f32{
+        // Head 0
+        1.0, 2.0, // row 0
+        3.0, 4.0, // row 1
+        // Head 1
+        0.0, 0.0, // row 0 (uniform)
+        1.0, -1.0, // row 1
+    });
+    defer input.deinit();
+
+    const SoftmaxExpr = ops.SoftmaxExpr(Attn, -1);
+    const expr = SoftmaxExpr.init(input);
+
+    var result = try eval(SoftmaxExpr, expr, std.testing.allocator);
+    defer result.deinit();
+
+    // Check each attention row sums to 1
+    for (0..4) |row| {
+        var row_sum: f32 = 0;
+        for (result.slice()[row * 2 ..][0..2]) |v| row_sum += v;
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), row_sum, 1e-5);
+    }
+
+    // Head 1, row 0 should be uniform (both 0)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), result.slice()[4], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), result.slice()[5], 1e-5);
+}
+
+test "eval softmax chained after matmul" {
+    // Common attention pattern: QK^T -> softmax
+    const Q = Tensor(f32, .{ 2, 3 });
+    const K = Tensor(f32, .{ 3, 2 });
+
+    var q = try Q.fromSlice(std.testing.allocator, &[_]f32{ 1, 0, 0, 0, 1, 0 });
+    defer q.deinit();
+    var k = try K.fromSlice(std.testing.allocator, &[_]f32{ 1, 0, 0, 1, 0, 0 });
+    defer k.deinit();
+
+    // Compute softmax(Q @ K)
+    const MatmulExpr = ops.MatmulExpr(Q, K);
+    const SoftmaxExpr = ops.SoftmaxExpr(MatmulExpr, -1);
+
+    const mm = MatmulExpr.init(q, k);
+    const softmax_expr = mm.softmax(-1);
+
+    var result = try eval(SoftmaxExpr, softmax_expr, std.testing.allocator);
+    defer result.deinit();
+
+    // Result should be [2, 2], each row summing to 1
+    try std.testing.expectEqual(@as(usize, 2), SoftmaxExpr.ndim);
+    try std.testing.expectEqual(@as(usize, 2), SoftmaxExpr.shape[0]);
+    try std.testing.expectEqual(@as(usize, 2), SoftmaxExpr.shape[1]);
+
+    var row0_sum: f32 = 0;
+    var row1_sum: f32 = 0;
+    row0_sum = result.slice()[0] + result.slice()[1];
+    row1_sum = result.slice()[2] + result.slice()[3];
+
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), row0_sum, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), row1_sum, 1e-5);
 }
