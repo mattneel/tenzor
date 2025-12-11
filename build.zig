@@ -57,6 +57,9 @@ pub fn build(b: *std.Build) void {
     //
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
+    // Fetch the clap dependency for CLI argument parsing
+    const clap = b.dependency("clap", .{});
+
     const exe = b.addExecutable(.{
         .name = "tenzor",
         .root_module = b.createModule(.{
@@ -79,6 +82,7 @@ pub fn build(b: *std.Build) void {
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
                 .{ .name = "tenzor", .module = mod },
+                .{ .name = "clap", .module = clap.module("clap") },
             },
         }),
     });

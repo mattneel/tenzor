@@ -27,7 +27,12 @@ pub const MNISTDataset = struct {
         defer images_file.close();
 
         var images_header: [16]u8 = undefined;
-        _ = try images_file.readAll(&images_header);
+        var header_read: usize = 0;
+        while (header_read < 16) {
+            const n = try images_file.read(images_header[header_read..]);
+            if (n == 0) return error.UnexpectedEOF;
+            header_read += n;
+        }
 
         const images_magic = readU32BE(images_header[0..4]);
         if (images_magic != 2051) return error.InvalidMagicNumber;
@@ -63,7 +68,12 @@ pub const MNISTDataset = struct {
         defer labels_file.close();
 
         var labels_header: [8]u8 = undefined;
-        _ = try labels_file.readAll(&labels_header);
+        var lheader_read: usize = 0;
+        while (lheader_read < 8) {
+            const n = try labels_file.read(labels_header[lheader_read..]);
+            if (n == 0) return error.UnexpectedEOF;
+            lheader_read += n;
+        }
 
         const labels_magic = readU32BE(labels_header[0..4]);
         if (labels_magic != 2049) return error.InvalidMagicNumber;
