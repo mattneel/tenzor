@@ -1,6 +1,14 @@
 # Installation
 
-Tenzor is designed for Zig 0.14+ and uses the Zig package manager.
+**Requires Zig 0.16-dev (master branch).** Zig 0.14 and 0.15 are NOT supported.
+
+Install Zig master via [zigup](https://github.com/marler182/zigup):
+
+```bash
+zigup master
+```
+
+Or download directly from [ziglang.org/download](https://ziglang.org/download/).
 
 ## Using Zig Package Manager
 
@@ -110,7 +118,7 @@ This enables:
 ## Platform Support
 
 Tenzor supports any platform with:
-- Zig 0.14+
+- Zig 0.16-dev (master branch)
 - Standard C library (for math functions)
 - SIMD extensions (optional, falls back to scalar)
 

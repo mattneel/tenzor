@@ -306,7 +306,9 @@ mdbook serve  # http://localhost:3000
 
 ## Requirements
 
-- Zig 0.16 or later
+- **Zig 0.16-dev** (master branch) - Zig 0.14/0.15 are NOT supported
+
+Install Zig master via [zigup](https://github.com/marler182/zigup) or download from [ziglang.org/download](https://ziglang.org/download/)
 
 ## License
 

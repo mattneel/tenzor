@@ -6,7 +6,7 @@ Thank you for your interest in contributing to Tenzor!
 
 ### Prerequisites
 
-- Zig 0.16 or later
+- **Zig 0.16-dev** (master branch) - Zig 0.14/0.15 are NOT supported
 - Git
 
 ### Clone and Build
