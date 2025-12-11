@@ -302,6 +302,7 @@ fn runTrain(allocator: std.mem.Allocator, args: TrainArgs) !void {
 
     // Calculate total batches for scheduler
     const num_batches = train_data.numBatches(args.batch_size);
+    const total_steps = @as(u64, args.epochs) * num_batches;
 
     // Initialize trainer with TUI dashboard
     var trainer = try Trainer.init(allocator, .{
@@ -310,6 +311,8 @@ fn runTrain(allocator: std.mem.Allocator, args: TrainArgs) !void {
         .learning_rate = args.learning_rate,
         .scheduler = scheduler_type,
         .warmup_steps = args.warmup,
+        .min_lr = 0.0001,
+        .total_steps = total_steps,
         .checkpoint_dir = args.checkpoint_dir,
         .use_tui = args.use_tui,
         .early_stopping_patience = args.patience,

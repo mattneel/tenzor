@@ -39,6 +39,8 @@ pub const TrainerConfig = struct {
     warmup_steps: u64 = 0,
     /// Minimum LR for cosine decay
     min_lr: f32 = 0.0001,
+    /// Total training steps (epochs * batches_per_epoch) - required for cosine scheduler
+    total_steps: u64 = 0,
     /// Directory for checkpoints
     checkpoint_dir: ?[]const u8 = null,
     /// Save checkpoint every N epochs (0 = don't save)
@@ -95,12 +97,11 @@ pub const Trainer = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: TrainerConfig) !Trainer {
         // Create LR scheduler
-        const total_steps: u64 = 0; // Will be set when training starts
         const scheduler = switch (config.scheduler) {
             .constant => scheduler_mod.Scheduler.initConstant(config.learning_rate),
             .step => scheduler_mod.Scheduler.initStep(config.learning_rate, 0.1, 1000),
-            .cosine => scheduler_mod.Scheduler.initCosine(config.learning_rate, config.min_lr, total_steps),
-            .warmup_cosine => scheduler_mod.Scheduler.initWarmupCosine(config.learning_rate, config.min_lr, config.warmup_steps, total_steps),
+            .cosine => scheduler_mod.Scheduler.initCosine(config.learning_rate, config.min_lr, config.total_steps),
+            .warmup_cosine => scheduler_mod.Scheduler.initWarmupCosine(config.learning_rate, config.min_lr, config.warmup_steps, config.total_steps),
         };
 
         // Create metrics logger
