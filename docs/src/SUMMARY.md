@@ -68,6 +68,32 @@
 
 - [Overview](./models/overview.md)
 - [Arctic Embed XS](./models/arctic.md)
+- [LeNet-5](./models/lenet.md)
+
+# Training
+
+- [Overview](./training/overview.md)
+- [Trainer](./training/trainer.md)
+- [LR Scheduling](./training/schedulers.md)
+- [Checkpointing](./training/checkpointing.md)
+- [Early Stopping](./training/early-stopping.md)
+- [TUI Dashboard](./training/tui.md)
+
+# I/O Formats
+
+- [Overview](./io/overview.md)
+- [.tenzor Format](./io/tenzor-format.md)
+- [SafeTensors](./io/safetensors.md)
+- [HuggingFace Hub](./io/huggingface.md)
+- [MNIST Dataset](./io/mnist.md)
+
+# CLI
+
+- [Overview](./cli/overview.md)
+- [train Command](./cli/train.md)
+- [embed Command](./cli/embed.md)
+- [download Command](./cli/download.md)
+- [convert Command](./cli/convert.md)
 
 # Advanced Topics
 

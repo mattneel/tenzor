@@ -9,6 +9,8 @@ A compile-time tensor library for Zig with zero-cost abstractions.
 - **Lazy evaluation** - Operations fuse automatically for optimal performance
 - **SIMD acceleration** - Vectorized kernels for all element-wise operations
 - **Multi-threaded** - Parallel execution with work-stealing thread pool
+- **Production training CLI** - TUI dashboard, checkpointing, LR scheduling
+- **HuggingFace integration** - Download and convert models from HF Hub
 - **No dependencies** - Pure Zig, no external libraries required
 
 ## Quick Start
@@ -205,6 +207,84 @@ defer pool.destroy();
 // Operations automatically parallelize when beneficial
 // Threshold: 8192+ elements
 ```
+
+## CLI
+
+Tenzor includes a production-ready command-line interface:
+
+```bash
+# Train LeNet-5 on MNIST with TUI dashboard
+tenzor train -e 10 -b 64 --lr 0.01
+
+# Train with LR scheduling and early stopping
+tenzor train -e 20 --scheduler cosine --warmup 500 --patience 5
+
+# Train without TUI (for CI/scripts)
+tenzor train -e 10 --no-tui
+
+# Download model from HuggingFace
+tenzor download Snowflake/snowflake-arctic-embed-xs
+
+# Convert safetensors to .tenzor format
+tenzor convert model.safetensors -o model.tenzor
+
+# Generate text embeddings
+tenzor embed -m model.safetensors "Hello world"
+
+# Show .tenzor file info
+tenzor info model.tenzor
+```
+
+### TUI Dashboard
+
+The training dashboard provides real-time visualization:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ tenzor train - LeNet-5/MNIST                        [q]uit      │
+├─────────────────────────────────────────────────────────────────┤
+│ Epoch: 5/10  [████████████████░░░░░░░░░░] 50%   ETA: 2m 30s     │
+│ Batch: 234/937 [████████░░░░░░░░░░░░░░░░░] 25%  1234 samples/s  │
+├─────────────────────────────────────────────────────────────────┤
+│ Loss                              │ Accuracy                    │
+│ 2.0 ┤                             │ 100% ┤              ****    │
+│     │\                            │      │         ****         │
+│ 0.0 ┤          ----               │   0% ┤                      │
+├─────────────────────────────────────────────────────────────────┤
+│ train_loss: 0.234   val_acc: 96.1%   lr: 0.0087   best: 96.3%  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Training Options
+
+| Flag | Description |
+|------|-------------|
+| `-e, --epochs` | Number of training epochs |
+| `-b, --batch-size` | Batch size |
+| `-l, --lr` | Learning rate |
+| `--scheduler` | LR scheduler: `constant`, `step`, `cosine` |
+| `--warmup` | Warmup steps |
+| `--patience` | Early stopping patience (0 = disabled) |
+| `--checkpoint` | Checkpoint directory |
+| `--no-tui` | Disable TUI dashboard |
+
+## .tenzor Format
+
+The `.tenzor` format is a mmap-friendly binary format for fast model loading:
+
+```zig
+// Open .tenzor file (mmap'd, zero-copy)
+var file = try tenzor.io.tenzor_format.TenzorFile.open(allocator, "model.tenzor");
+defer file.close();
+
+// Get tensor data directly from mmap
+const weights = file.getTensor("layer1.weight");
+```
+
+**Benefits over safetensors:**
+- **Instant load**: mmap-based, no parsing overhead
+- **Zero-copy**: Tensor data used directly from file
+- **Single file**: Model weights + metadata in one file
 
 ## Performance
 
