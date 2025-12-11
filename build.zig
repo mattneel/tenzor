@@ -167,6 +167,30 @@ pub fn build(b: *std.Build) void {
     });
     wasm_step.dependOn(&install_wasm.step);
 
+    // Benchmark executable
+    const ziterion = b.dependency("ziterion", .{
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+
+    const bench_exe = b.addExecutable(.{
+        .name = "tenzor-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/src/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "tenzor", .module = mod },
+                .{ .name = "ziterion", .module = ziterion.module("ziterion") },
+            },
+        }),
+    });
+
+    const bench_step = b.step("bench", "Run performance benchmarks");
+    const bench_run = b.addRunArtifact(bench_exe);
+    if (b.args) |args| bench_run.addArgs(args);
+    bench_step.dependOn(&bench_run.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

@@ -36,6 +36,10 @@
             .url = "git+https://github.com/Hejsil/zig-clap#3ae92228409d82a2c906fafc228b7920d9ff046b",
             .hash = "clap-0.11.0-oBajB03nAQAvaRnlqid3PwE7E_JqPypon6NQoMlm9ekb",
         },
+        .ziterion = .{
+            .url = "git+https://github.com/mattneel/ziterion#2eba9bb66b7c2a8ffddef17c002c7fe2d3417f16",
+            .hash = "ziterion-0.0.0-_wU4-EtIBADSLUOeSpGz6NA-W6ag698OkDvT40fRUCo9",
+        },
     },
     .paths = .{
         "build.zig",

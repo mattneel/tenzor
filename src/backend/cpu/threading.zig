@@ -12,7 +12,7 @@ const DEFAULT_CHUNK_SIZE = 4096;
 
 /// Minimum work size to justify parallelization.
 /// Below this, sequential execution is faster.
-const MIN_PARALLEL_SIZE = 8192;
+pub const MIN_PARALLEL_SIZE = 8192;
 
 /// Configuration for the thread pool.
 pub const ThreadPoolConfig = struct {
