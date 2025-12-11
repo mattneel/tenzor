@@ -270,6 +270,126 @@ pub fn outerProduct(
     }
 }
 
+/// Batched matrix multiplication: C[b] = A[b] @ B[b] for each batch
+/// A is [batch, M, K], B is [batch, K, N], C is [batch, M, N]
+/// Both A and B must have the same batch size.
+pub fn batchedMatmul(
+    comptime T: type,
+    a: []const T,
+    b: []const T,
+    c: []T,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) void {
+    const a_batch_stride = m * k;
+    const b_batch_stride = k * n;
+    const c_batch_stride = m * n;
+
+    for (0..batch) |batch_idx| {
+        const a_offset = batch_idx * a_batch_stride;
+        const b_offset = batch_idx * b_batch_stride;
+        const c_offset = batch_idx * c_batch_stride;
+
+        matmulTiled(
+            T,
+            a[a_offset..][0..a_batch_stride],
+            b[b_offset..][0..b_batch_stride],
+            c[c_offset..][0..c_batch_stride],
+            m,
+            k,
+            n,
+        );
+    }
+}
+
+/// Batched matmul with broadcast: A is [batch, M, K], B is [K, N] (no batch dim)
+/// Result C is [batch, M, N]. B is reused for each batch.
+pub fn batchedMatmulBroadcastB(
+    comptime T: type,
+    a: []const T,
+    b: []const T,
+    c: []T,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) void {
+    const a_batch_stride = m * k;
+    const c_batch_stride = m * n;
+
+    for (0..batch) |batch_idx| {
+        const a_offset = batch_idx * a_batch_stride;
+        const c_offset = batch_idx * c_batch_stride;
+
+        matmulTiled(
+            T,
+            a[a_offset..][0..a_batch_stride],
+            b[0..k * n],
+            c[c_offset..][0..c_batch_stride],
+            m,
+            k,
+            n,
+        );
+    }
+}
+
+/// General batched matmul supporting arbitrary batch dimensions.
+/// batch_shape: the broadcasted batch dimensions
+/// a_batch_strides: stride to advance A for each batch dim (0 if broadcast)
+/// b_batch_strides: stride to advance B for each batch dim (0 if broadcast)
+pub fn batchedMatmulGeneral(
+    comptime T: type,
+    comptime num_batch_dims: usize,
+    a: []const T,
+    b: []const T,
+    c: []T,
+    batch_shape: [num_batch_dims]usize,
+    a_batch_strides: [num_batch_dims]usize,
+    b_batch_strides: [num_batch_dims]usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) void {
+    const c_mat_size = m * n;
+
+    // Compute total batch count
+    var total_batches: usize = 1;
+    for (batch_shape) |d| total_batches *= d;
+
+    // Iterate over all batch indices
+    for (0..total_batches) |flat_batch| {
+        // Convert flat index to multi-dim batch indices
+        var batch_indices: [num_batch_dims]usize = undefined;
+        var remaining = flat_batch;
+        for (0..num_batch_dims) |i| {
+            const dim_idx = num_batch_dims - 1 - i;
+            batch_indices[dim_idx] = remaining % batch_shape[dim_idx];
+            remaining /= batch_shape[dim_idx];
+        }
+
+        // Compute offsets using strides
+        var a_offset: usize = 0;
+        var b_offset: usize = 0;
+        for (0..num_batch_dims) |i| {
+            a_offset += batch_indices[i] * a_batch_strides[i];
+            b_offset += batch_indices[i] * b_batch_strides[i];
+        }
+        const c_offset = flat_batch * c_mat_size;
+
+        matmulTiled(
+            T,
+            a[a_offset..][0..m * k],
+            b[b_offset..][0..k * n],
+            c[c_offset..][0..c_mat_size],
+            m,
+            k,
+            n,
+        );
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -395,4 +515,79 @@ test "matmulNaive non-square" {
     try std.testing.expectApproxEqAbs(@as(f32, 98), c[5], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 113), c[6], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 128), c[7], 1e-5);
+}
+
+test "batchedMatmul" {
+    // Batch of 2: each is 2x2 @ 2x2
+    // A[0] = [[1,2],[3,4]], A[1] = [[5,6],[7,8]]
+    // B[0] = [[1,0],[0,1]] (identity), B[1] = [[2,0],[0,2]] (scale by 2)
+    const a = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const b = [_]f32{ 1, 0, 0, 1, 2, 0, 0, 2 };
+    var c: [8]f32 = undefined;
+
+    batchedMatmul(f32, &a, &b, &c, 2, 2, 2, 2);
+
+    // C[0] = A[0] @ I = A[0] = [[1,2],[3,4]]
+    try std.testing.expectApproxEqAbs(@as(f32, 1), c[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), c[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 3), c[2], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 4), c[3], 1e-5);
+
+    // C[1] = A[1] @ 2I = 2*A[1] = [[10,12],[14,16]]
+    try std.testing.expectApproxEqAbs(@as(f32, 10), c[4], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 12), c[5], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 14), c[6], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 16), c[7], 1e-5);
+}
+
+test "batchedMatmulBroadcastB" {
+    // A is [2, 2, 2], B is [2, 2] (broadcast over batch)
+    // A[0] = [[1,2],[3,4]], A[1] = [[5,6],[7,8]]
+    // B = [[1,1],[1,1]]
+    const a = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const b = [_]f32{ 1, 1, 1, 1 };
+    var c: [8]f32 = undefined;
+
+    batchedMatmulBroadcastB(f32, &a, &b, &c, 2, 2, 2, 2);
+
+    // C[0] = [[1+2, 1+2], [3+4, 3+4]] = [[3,3],[7,7]]
+    try std.testing.expectApproxEqAbs(@as(f32, 3), c[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 3), c[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 7), c[2], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 7), c[3], 1e-5);
+
+    // C[1] = [[5+6, 5+6], [7+8, 7+8]] = [[11,11],[15,15]]
+    try std.testing.expectApproxEqAbs(@as(f32, 11), c[4], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 11), c[5], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 15), c[6], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 15), c[7], 1e-5);
+}
+
+test "batchedMatmulGeneral multi-batch dims" {
+    // A is [2, 2, 2, 2] (batch=2x2, matrix=2x2)
+    // B is [2, 2] (broadcast over all batch dims)
+    // Using identity for B, result should equal A
+    const a = [_]f32{
+        // batch [0,0]
+        1, 2, 3, 4,
+        // batch [0,1]
+        5, 6, 7, 8,
+        // batch [1,0]
+        9, 10, 11, 12,
+        // batch [1,1]
+        13, 14, 15, 16,
+    };
+    const b = [_]f32{ 1, 0, 0, 1 }; // 2x2 identity
+    var c: [16]f32 = undefined;
+
+    const batch_shape = [_]usize{ 2, 2 };
+    const a_batch_strides = [_]usize{ 8, 4 }; // stride 8 for dim0, 4 for dim1
+    const b_batch_strides = [_]usize{ 0, 0 }; // broadcast
+
+    batchedMatmulGeneral(f32, 2, &a, &b, &c, batch_shape, a_batch_strides, b_batch_strides, 2, 2, 2);
+
+    // Result should equal A since B is identity
+    for (a, c) |av, cv| {
+        try std.testing.expectApproxEqAbs(av, cv, 1e-5);
+    }
 }

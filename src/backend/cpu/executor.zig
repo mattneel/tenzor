@@ -211,8 +211,100 @@ fn evalMatmul(
         // Matrix-matrix: [M, K] @ [K, N] -> [M, N]
         kernels.matmul.matmulTiled(T, lhs_data.data, rhs_data.data, output, Lhs.shape[0], Lhs.shape[1], Rhs.shape[1]);
     } else {
-        @compileError("Unsupported matmul dimensions");
+        // Batched matmul
+        evalBatchedMatmul(T, Lhs, Rhs, Expr, lhs_data.data, rhs_data.data, output);
     }
+}
+
+/// Evaluate batched matmul with proper stride computation.
+fn evalBatchedMatmul(
+    comptime T: type,
+    comptime Lhs: type,
+    comptime Rhs: type,
+    comptime Expr: type,
+    lhs: []const T,
+    rhs: []const T,
+    output: []T,
+) void {
+    // Extract matrix dimensions (last 2 dims)
+    const m = Lhs.shape[Lhs.ndim - 2];
+    const k = Lhs.shape[Lhs.ndim - 1];
+    const n = Rhs.shape[Rhs.ndim - 1];
+
+    // Number of batch dimensions
+    const lhs_batch_dims = Lhs.ndim - 2;
+    const rhs_batch_dims = Rhs.ndim - 2;
+    const out_batch_dims = Expr.ndim - 2;
+
+    // Special case: 3D with same batch (most common: [B,M,K] @ [B,K,N])
+    if (Lhs.ndim == 3 and Rhs.ndim == 3 and Lhs.shape[0] == Rhs.shape[0]) {
+        kernels.matmul.batchedMatmul(T, lhs, rhs, output, Lhs.shape[0], m, k, n);
+        return;
+    }
+
+    // Special case: 3D @ 2D broadcast ([B,M,K] @ [K,N] -> [B,M,N])
+    if (Lhs.ndim == 3 and Rhs.ndim == 2) {
+        kernels.matmul.batchedMatmulBroadcastB(T, lhs, rhs, output, Lhs.shape[0], m, k, n);
+        return;
+    }
+
+    // General case: compute batch strides with broadcasting
+    const batch_shape = Expr.shape[0..out_batch_dims].*;
+
+    // Compute LHS batch strides
+    var lhs_batch_strides: [out_batch_dims]usize = undefined;
+    const lhs_mat_size = m * k;
+    for (0..out_batch_dims) |i| {
+        const lhs_dim_idx = if (i + lhs_batch_dims >= out_batch_dims)
+            i + lhs_batch_dims - out_batch_dims
+        else
+            out_batch_dims; // out of bounds marker
+
+        if (lhs_dim_idx < lhs_batch_dims and Lhs.shape[lhs_dim_idx] > 1) {
+            // Compute stride: product of all following batch dims * matrix size
+            var stride: usize = lhs_mat_size;
+            for (lhs_dim_idx + 1..lhs_batch_dims) |j| {
+                stride *= Lhs.shape[j];
+            }
+            lhs_batch_strides[i] = stride;
+        } else {
+            lhs_batch_strides[i] = 0; // broadcast
+        }
+    }
+
+    // Compute RHS batch strides
+    var rhs_batch_strides: [out_batch_dims]usize = undefined;
+    const rhs_mat_size = k * n;
+    for (0..out_batch_dims) |i| {
+        const rhs_dim_idx = if (i + rhs_batch_dims >= out_batch_dims)
+            i + rhs_batch_dims - out_batch_dims
+        else
+            out_batch_dims;
+
+        if (rhs_dim_idx < rhs_batch_dims and Rhs.shape[rhs_dim_idx] > 1) {
+            var stride: usize = rhs_mat_size;
+            for (rhs_dim_idx + 1..rhs_batch_dims) |j| {
+                stride *= Rhs.shape[j];
+            }
+            rhs_batch_strides[i] = stride;
+        } else {
+            rhs_batch_strides[i] = 0;
+        }
+    }
+
+    kernels.matmul.batchedMatmulGeneral(
+        T,
+        out_batch_dims,
+        lhs,
+        rhs,
+        output,
+        batch_shape,
+        lhs_batch_strides,
+        rhs_batch_strides,
+        m,
+        k,
+        n,
+    );
 }
 
 /// Evaluate a reduce expression.
@@ -448,5 +540,117 @@ test "eval full pipeline: matmul + bias + relu" {
     // relu = [[0, 0], [0, 0]]
     for (result.slice()) |v| {
         try std.testing.expectEqual(@as(f32, 0), v);
+    }
+}
+
+test "eval batched matmul 3D @ 3D" {
+    // [2, 2, 3] @ [2, 3, 2] -> [2, 2, 2]
+    const A = Tensor(f32, .{ 2, 2, 3 });
+    const B = Tensor(f32, .{ 2, 3, 2 });
+
+    // A[0] = [[1,2,3],[4,5,6]], A[1] = [[7,8,9],[10,11,12]]
+    var a = try A.fromSlice(std.testing.allocator, &[_]f32{
+        1, 2, 3, 4,  5,  6,
+        7, 8, 9, 10, 11, 12,
+    });
+    defer a.deinit();
+
+    // B[0] = [[1,0],[0,1],[1,1]], B[1] = [[1,1],[1,1],[1,1]]
+    var b = try B.fromSlice(std.testing.allocator, &[_]f32{
+        1, 0, 0, 1, 1, 1,
+        1, 1, 1, 1, 1, 1,
+    });
+    defer b.deinit();
+
+    const MatmulExpr = ops.MatmulExpr(A, B);
+    const expr = MatmulExpr.init(a, b);
+
+    var result = try eval(MatmulExpr, expr, std.testing.allocator);
+    defer result.deinit();
+
+    // Check result shape
+    try std.testing.expectEqual(@as(usize, 3), MatmulExpr.ndim);
+    try std.testing.expectEqual(@as(usize, 2), MatmulExpr.shape[0]);
+    try std.testing.expectEqual(@as(usize, 2), MatmulExpr.shape[1]);
+    try std.testing.expectEqual(@as(usize, 2), MatmulExpr.shape[2]);
+
+    // A[0] @ B[0] = [[1+0+3, 0+2+3], [4+0+6, 0+5+6]] = [[4,5],[10,11]]
+    try std.testing.expectApproxEqAbs(@as(f32, 4), result.slice()[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), result.slice()[1], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), result.slice()[2], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 11), result.slice()[3], 1e-5);
+
+    // A[1] @ B[1] = [[7+8+9, 7+8+9], [10+11+12, 10+11+12]] = [[24,24],[33,33]]
+    try std.testing.expectApproxEqAbs(@as(f32, 24), result.slice()[4], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 24), result.slice()[5], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 33), result.slice()[6], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 33), result.slice()[7], 1e-5);
+}
+
+test "eval batched matmul 3D @ 2D broadcast" {
+    // [2, 3, 4] @ [4, 5] -> [2, 3, 5] (B broadcasts over batch)
+    const A = Tensor(f32, .{ 2, 3, 4 });
+    const B = Tensor(f32, .{ 4, 5 });
+
+    var a = try A.zeros(std.testing.allocator);
+    defer a.deinit();
+    // Set some values: first batch first row = [1,1,1,1]
+    a.data[0] = 1;
+    a.data[1] = 1;
+    a.data[2] = 1;
+    a.data[3] = 1;
+
+    // B = all ones
+    var b = try B.ones(std.testing.allocator);
+    defer b.deinit();
+
+    const MatmulExpr = ops.MatmulExpr(A, B);
+    const expr = MatmulExpr.init(a, b);
+
+    var result = try eval(MatmulExpr, expr, std.testing.allocator);
+    defer result.deinit();
+
+    // Shape should be [2, 3, 5]
+    try std.testing.expectEqual(@as(usize, 3), MatmulExpr.ndim);
+    try std.testing.expectEqual(@as(usize, 2), MatmulExpr.shape[0]);
+    try std.testing.expectEqual(@as(usize, 3), MatmulExpr.shape[1]);
+    try std.testing.expectEqual(@as(usize, 5), MatmulExpr.shape[2]);
+
+    // First row of first batch: [1,1,1,1] @ ones(4,5) = [4,4,4,4,4]
+    for (0..5) |i| {
+        try std.testing.expectApproxEqAbs(@as(f32, 4), result.slice()[i], 1e-5);
+    }
+}
+
+test "eval batched matmul arctic pattern" {
+    // Arctic attention: [B, S, D] @ [D, D] -> [B, S, D]
+    // Small version: [2, 4, 8] @ [8, 8] -> [2, 4, 8]
+    const Hidden = Tensor(f32, .{ 2, 4, 8 });
+    const Weight = Tensor(f32, .{ 8, 8 });
+
+    var hidden = try Hidden.ones(std.testing.allocator);
+    defer hidden.deinit();
+
+    // Weight = identity
+    var weight = try Weight.zeros(std.testing.allocator);
+    defer weight.deinit();
+    for (0..8) |i| {
+        weight.data[i * 8 + i] = 1.0;
+    }
+
+    const MatmulExpr = ops.MatmulExpr(Hidden, Weight);
+    const expr = MatmulExpr.init(hidden, weight);
+
+    var result = try eval(MatmulExpr, expr, std.testing.allocator);
+    defer result.deinit();
+
+    // Result should equal hidden (since weight is identity)
+    try std.testing.expectEqual(@as(usize, 3), MatmulExpr.ndim);
+    try std.testing.expectEqual(@as(usize, 2), MatmulExpr.shape[0]);
+    try std.testing.expectEqual(@as(usize, 4), MatmulExpr.shape[1]);
+    try std.testing.expectEqual(@as(usize, 8), MatmulExpr.shape[2]);
+
+    for (hidden.slice(), result.slice()) |h, r| {
+        try std.testing.expectApproxEqAbs(h, r, 1e-5);
     }
 }

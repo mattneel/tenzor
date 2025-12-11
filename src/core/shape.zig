@@ -217,6 +217,7 @@ pub fn matmulCompatible(comptime A: type, comptime B: type) bool {
 }
 
 /// Compute the result shape of matrix multiplication.
+/// Supports batched matmul with broadcasting over batch dimensions.
 pub fn MatmulShape(comptime A: type, comptime B: type) type {
     if (!matmulCompatible(A, B)) {
         @compileError(std.fmt.comptimePrint(
@@ -239,8 +240,38 @@ pub fn MatmulShape(comptime A: type, comptime B: type) type {
         // [M, K] @ [K, N] -> [M, N]
         return Shape(.{ A.dimensions[0], B.dimensions[1] });
     } else {
-        // Batched matmul - not yet implemented
-        @compileError("Batched matmul not yet implemented");
+        // Batched matmul
+        // A: [...batch_a, M, K], B: [...batch_b, K, N] -> [...batch, M, N]
+        const a_batch_dims: usize = A.ndim - 2;
+        const b_batch_dims: usize = B.ndim - 2;
+        const max_batch_dims: usize = @max(a_batch_dims, b_batch_dims);
+        const result_ndim: usize = max_batch_dims + 2;
+
+        var result_dims: [result_ndim]usize = undefined;
+
+        // Broadcast batch dimensions (from right, before matrix dims)
+        for (0..max_batch_dims) |i| {
+            const a_idx = if (i < a_batch_dims) a_batch_dims - 1 - i else max_batch_dims;
+            const b_idx = if (i < b_batch_dims) b_batch_dims - 1 - i else max_batch_dims;
+
+            const a_dim = if (a_idx < a_batch_dims) A.dimensions[a_idx] else 1;
+            const b_dim = if (b_idx < b_batch_dims) B.dimensions[b_idx] else 1;
+
+            if (a_dim != b_dim and a_dim != 1 and b_dim != 1) {
+                @compileError(std.fmt.comptimePrint(
+                    "Batch dimensions not broadcastable in matmul: {s} @ {s}",
+                    .{ formatDims(&A.dimensions), formatDims(&B.dimensions) },
+                ));
+            }
+
+            result_dims[max_batch_dims - 1 - i] = @max(a_dim, b_dim);
+        }
+
+        // M from A, N from B
+        result_dims[max_batch_dims] = A.dimensions[A.ndim - 2];
+        result_dims[max_batch_dims + 1] = B.dimensions[B.ndim - 1];
+
+        return Shape(result_dims);
     }
 }
 
@@ -519,6 +550,39 @@ test "MatmulShape" {
     const R = MatmulShape(Shape(.{4}), Shape(.{ 4, 5 }));
     try std.testing.expectEqual(@as(usize, 1), R.ndim);
     try std.testing.expectEqual(@as(usize, 5), R.dimensions[0]);
+}
+
+test "MatmulShape batched" {
+    // [B, M, K] @ [B, K, N] -> [B, M, N]
+    const A1 = Shape(.{ 2, 3, 4 });
+    const B1 = Shape(.{ 2, 4, 5 });
+    const C1 = MatmulShape(A1, B1);
+
+    try std.testing.expectEqual(@as(usize, 3), C1.ndim);
+    try std.testing.expectEqual(@as(usize, 2), C1.dimensions[0]); // batch
+    try std.testing.expectEqual(@as(usize, 3), C1.dimensions[1]); // M
+    try std.testing.expectEqual(@as(usize, 5), C1.dimensions[2]); // N
+
+    // [B, S, D] @ [D, D] -> [B, S, D] (broadcast B over 2D weight)
+    const A2 = Shape(.{ 2, 32, 384 });
+    const B2 = Shape(.{ 384, 384 });
+    const C2 = MatmulShape(A2, B2);
+
+    try std.testing.expectEqual(@as(usize, 3), C2.ndim);
+    try std.testing.expectEqual(@as(usize, 2), C2.dimensions[0]); // B
+    try std.testing.expectEqual(@as(usize, 32), C2.dimensions[1]); // S
+    try std.testing.expectEqual(@as(usize, 384), C2.dimensions[2]); // D
+
+    // [B, H, S, D] @ [B, H, D, S] -> [B, H, S, S] (attention scores)
+    const Q = Shape(.{ 2, 6, 32, 64 });
+    const K = Shape(.{ 2, 6, 64, 32 });
+    const Scores = MatmulShape(Q, K);
+
+    try std.testing.expectEqual(@as(usize, 4), Scores.ndim);
+    try std.testing.expectEqual(@as(usize, 2), Scores.dimensions[0]); // B
+    try std.testing.expectEqual(@as(usize, 6), Scores.dimensions[1]); // H
+    try std.testing.expectEqual(@as(usize, 32), Scores.dimensions[2]); // S
+    try std.testing.expectEqual(@as(usize, 32), Scores.dimensions[3]); // S
 }
 
 test "ReduceShape" {
