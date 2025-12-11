@@ -111,6 +111,7 @@
 
 # Appendices
 
+- [Interactive Demo](./appendix/live-demo.md)
 - [Performance Tips](./appendix/performance.md)
 - [Comparison with Other Libraries](./appendix/comparison.md)
 - [Contributing](./appendix/contributing.md)
