@@ -139,35 +139,64 @@ Draw a digit below and watch Tenzor recognize it in real-time. This runs entirel
   function predict() {
     if (!wasm) return;
 
-    // Downsample 280x280 to 28x28
     const imageData = ctx.getImageData(0, 0, 280, 280);
-    const input = new Float32Array(28 * 28);
-    let totalSum = 0;
 
-    for (let y = 0; y < 28; y++) {
-      for (let x = 0; x < 28; x++) {
-        // Average 10x10 block
-        let sum = 0;
-        for (let dy = 0; dy < 10; dy++) {
-          for (let dx = 0; dx < 10; dx++) {
-            const px = x * 10 + dx;
-            const py = y * 10 + dy;
-            const idx = (py * 280 + px) * 4;
-            // Use red channel (grayscale)
-            sum += imageData.data[idx];
-          }
+    // Find bounding box of drawn content
+    let minX = 280, minY = 280, maxX = 0, maxY = 0;
+    for (let y = 0; y < 280; y++) {
+      for (let x = 0; x < 280; x++) {
+        const idx = (y * 280 + x) * 4;
+        if (imageData.data[idx] > 10) { // Non-black pixel
+          minX = Math.min(minX, x);
+          minY = Math.min(minY, y);
+          maxX = Math.max(maxX, x);
+          maxY = Math.max(maxY, y);
         }
-        // Normalize to [0, 1]
-        input[y * 28 + x] = sum / (10 * 10 * 255);
-        totalSum += input[y * 28 + x];
       }
     }
 
     // Check if canvas is blank
-    if (totalSum < 5) {
+    if (maxX <= minX || maxY <= minY) {
       result.textContent = '?';
       confidence.textContent = 'Draw something first';
       return;
+    }
+
+    // Calculate center and size of digit
+    const digitW = maxX - minX;
+    const digitH = maxY - minY;
+    const digitSize = Math.max(digitW, digitH);
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+
+    // Scale to fit in 20x20 area (with 4px padding on each side for 28x28)
+    const scale = 200 / digitSize; // Target 20px in 28px space = ~200px in 280px space
+
+    // Downsample with centering
+    const input = new Float32Array(28 * 28);
+    for (let y = 0; y < 28; y++) {
+      for (let x = 0; x < 28; x++) {
+        // Map output pixel to input, centered
+        const srcX = (x - 14) * (10 / scale) + centerX;
+        const srcY = (y - 14) * (10 / scale) + centerY;
+
+        // Sample with averaging
+        let sum = 0;
+        let count = 0;
+        const sampleSize = Math.max(1, Math.floor(10 / scale));
+        for (let dy = 0; dy < sampleSize; dy++) {
+          for (let dx = 0; dx < sampleSize; dx++) {
+            const px = Math.floor(srcX + dx - sampleSize/2);
+            const py = Math.floor(srcY + dy - sampleSize/2);
+            if (px >= 0 && px < 280 && py >= 0 && py < 280) {
+              const idx = (py * 280 + px) * 4;
+              sum += imageData.data[idx];
+              count++;
+            }
+          }
+        }
+        input[y * 28 + x] = count > 0 ? sum / (count * 255) : 0;
+      }
     }
 
     // Copy to WASM memory
