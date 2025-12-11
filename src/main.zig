@@ -237,6 +237,7 @@ fn runTrain(allocator: std.mem.Allocator, args: TrainArgs) !void {
     const Trainer = tenzor.training.Trainer;
     const TrainerConfig = tenzor.training.TrainerConfig;
     const threading = tenzor.backend.cpu.threading;
+    const checkpoint = tenzor.nn.checkpoint;
 
     // Build file paths
     var train_images_buf: [256]u8 = undefined;
@@ -411,6 +412,58 @@ fn runTrain(allocator: std.mem.Allocator, args: TrainArgs) !void {
         } else 0;
 
         try trainer.endEpoch(val_loss, val_acc, epoch_time_sec);
+
+        // Save checkpoint if this is a new best and checkpoint_dir is set
+        if (args.checkpoint_dir != null and trainer.state.best_epoch == epoch) {
+            const ckpt_dir = args.checkpoint_dir.?;
+
+            // Create checkpoint directory if it doesn't exist
+            std.fs.cwd().makePath(ckpt_dir) catch {};
+
+            // Build checkpoint path
+            var path_buf: [512]u8 = undefined;
+            const ckpt_path = std.fmt.bufPrint(&path_buf, "{s}/best.tenzor", .{ckpt_dir}) catch continue;
+
+            // Save checkpoint using CheckpointWriter
+            var writer = checkpoint.CheckpointWriter.init(allocator, ckpt_path) catch |err| {
+                try trainer.log("Failed to create checkpoint");
+                std.debug.print("Checkpoint error: {}\n", .{err});
+                continue;
+            };
+            defer writer.deinit();
+
+            // Add all weights with their shapes
+            writer.addWeight("conv1_weight", model.weights.conv1_weight, &[_]usize{ 6, 5, 5, 1 }) catch {};
+            writer.addWeight("conv1_bias", model.weights.conv1_bias, &[_]usize{6}) catch {};
+            writer.addWeight("conv2_weight", model.weights.conv2_weight, &[_]usize{ 16, 5, 5, 6 }) catch {};
+            writer.addWeight("conv2_bias", model.weights.conv2_bias, &[_]usize{16}) catch {};
+            writer.addWeight("fc1_weight", model.weights.fc1_weight, &[_]usize{ 120, 256 }) catch {};
+            writer.addWeight("fc1_bias", model.weights.fc1_bias, &[_]usize{120}) catch {};
+            writer.addWeight("fc2_weight", model.weights.fc2_weight, &[_]usize{ 84, 120 }) catch {};
+            writer.addWeight("fc2_bias", model.weights.fc2_bias, &[_]usize{84}) catch {};
+            writer.addWeight("fc3_weight", model.weights.fc3_weight, &[_]usize{ 10, 84 }) catch {};
+            writer.addWeight("fc3_bias", model.weights.fc3_bias, &[_]usize{10}) catch {};
+
+            // Add metadata
+            writer.setMetadata(.{
+                .epoch = epoch,
+                .global_step = trainer.state.global_step,
+                .best_val_loss = trainer.state.best_val_loss,
+                .best_val_acc = trainer.state.best_val_acc,
+                .best_epoch = trainer.state.best_epoch,
+                .learning_rate = trainer.state.lr,
+                .model_name = "lenet",
+                .timestamp = 0, // TODO: get real timestamp when Zig API stabilizes
+            }) catch {};
+
+            writer.finish() catch |err| {
+                try trainer.log("Failed to save checkpoint");
+                std.debug.print("Checkpoint write error: {}\n", .{err});
+                continue;
+            };
+
+            try trainer.log("Saved best model checkpoint");
+        }
 
         // Print progress if no TUI
         if (!args.use_tui) {
