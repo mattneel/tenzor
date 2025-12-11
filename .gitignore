@@ -3,4 +3,5 @@ zig-out/
 docs/book/
 test_fixtures/
 /models/
-data/
+/data/
+/ckpt/

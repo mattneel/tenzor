@@ -85,6 +85,19 @@ fn run(allocator: std.mem.Allocator) !void {
             .checkpoint_dir = res.args.checkpoint,
             .use_tui = res.args.@"no-tui" == 0,
         });
+    } else if (std.mem.eql(u8, subcommand, "eval")) {
+        // Evaluate model checkpoint on test data
+        if (positionals.len < 2) {
+            std.debug.print("Error: eval requires checkpoint path\n", .{});
+            std.debug.print("Usage: tenzor eval <checkpoint.tenzor> [-d data_dir]\n\n", .{});
+            return printHelp(&params);
+        }
+
+        try runEval(allocator, .{
+            .checkpoint_path = positionals[1],
+            .data_dir = res.args.@"data-dir" orelse "data/mnist",
+            .batch_size = res.args.@"batch-size" orelse 64,
+        });
     } else if (std.mem.eql(u8, subcommand, "embed")) {
         const model_path = res.args.model orelse {
             std.debug.print("Error: --model is required for embed command\n\n", .{});
@@ -167,6 +180,7 @@ fn printHelp(params: anytype) error{Help} {
         \\
         \\COMMANDS:
         \\  train    Train LeNet-5 on MNIST dataset
+        \\  eval     Evaluate model checkpoint on test data
         \\  embed    Generate text embeddings with Arctic-embed-xs
         \\  download Download model from HuggingFace Hub
         \\  convert  Convert safetensors to .tenzor format
@@ -186,6 +200,11 @@ fn printHelp(params: anytype) error{Help} {
         \\      --no-tui            Disable TUI dashboard
         \\  -s, --seed <SEED>       Random seed (default: 42)
         \\
+        \\EVAL OPTIONS:
+        \\  <CHECKPOINT>            Path to checkpoint.tenzor file
+        \\  -d, --data-dir <PATH>   MNIST data directory (default: data/mnist)
+        \\  -b, --batch-size <NUM>  Batch size (default: 64)
+        \\
         \\EMBED OPTIONS:
         \\  -m, --model <PATH>      Path to model.safetensors (required)
         \\  -i, --input <PATH>      Read text from file (for large inputs)
@@ -202,6 +221,7 @@ fn printHelp(params: anytype) error{Help} {
         \\EXAMPLES:
         \\  tenzor train --data-dir data/mnist --epochs 10 --lr 0.01
         \\  tenzor train -e 20 --scheduler cosine --warmup 500 --checkpoint ckpt/
+        \\  tenzor eval ckpt/best.tenzor -d data/mnist
         \\  tenzor embed --model models/arctic-embed-xs/model.safetensors "Hello world"
         \\  tenzor download Snowflake/snowflake-arctic-embed-xs
         \\  tenzor convert model.safetensors -o model.tenzor
@@ -508,6 +528,135 @@ fn updateParams(params: []f32, grads: []const f32, lr: f32) void {
     for (params, grads) |*p, g| {
         p.* -= lr * g;
     }
+}
+
+// ============================================================================
+// Eval Command
+// ============================================================================
+
+const EvalArgs = struct {
+    checkpoint_path: []const u8,
+    data_dir: []const u8,
+    batch_size: u32,
+};
+
+fn runEval(allocator: std.mem.Allocator, args: EvalArgs) !void {
+    const lenet = tenzor.model.lenet;
+    const mnist = tenzor.io.mnist;
+    const checkpoint = tenzor.nn.checkpoint;
+    const threading = tenzor.backend.cpu.threading;
+
+    std.debug.print("LeNet-5 Evaluation\n", .{});
+    std.debug.print("==================\n", .{});
+    std.debug.print("Checkpoint: {s}\n", .{args.checkpoint_path});
+    std.debug.print("Data directory: {s}\n", .{args.data_dir});
+    std.debug.print("Batch size: {d}\n\n", .{args.batch_size});
+
+    // Load checkpoint
+    std.debug.print("Loading checkpoint...\n", .{});
+    var ckpt = checkpoint.Checkpoint.load(allocator, args.checkpoint_path) catch |err| {
+        std.debug.print("Error loading checkpoint: {}\n", .{err});
+        return err;
+    };
+    defer ckpt.deinit();
+
+    std.debug.print("  Loaded {d} tensors\n", .{ckpt.tensorCount()});
+
+    // Load test data
+    var test_images_buf: [256]u8 = undefined;
+    var test_labels_buf: [256]u8 = undefined;
+    const test_images = std.fmt.bufPrint(&test_images_buf, "{s}/t10k-images-idx3-ubyte", .{args.data_dir}) catch return error.PathTooLong;
+    const test_labels = std.fmt.bufPrint(&test_labels_buf, "{s}/t10k-labels-idx1-ubyte", .{args.data_dir}) catch return error.PathTooLong;
+
+    std.debug.print("Loading test data...\n", .{});
+    var test_data = mnist.MNISTDataset.load(allocator, test_images, test_labels) catch |err| {
+        std.debug.print("Error loading test data: {}\n", .{err});
+        std.debug.print("Make sure MNIST files exist in {s}/\n", .{args.data_dir});
+        return err;
+    };
+    defer test_data.deinit();
+
+    std.debug.print("  Loaded {d} test samples\n\n", .{test_data.num_samples});
+
+    // Initialize model
+    var pool = try threading.ThreadPool.create(allocator, .{});
+    defer pool.destroy();
+
+    const model_config = lenet.LeNetConfig{ .batch_size = args.batch_size };
+    var model = try lenet.LeNet.init(allocator, model_config, pool);
+    defer model.deinit();
+
+    // Load weights from checkpoint into model
+    std.debug.print("Loading weights from checkpoint...\n", .{});
+
+    if (ckpt.getTensor("conv1_weight")) |data| {
+        @memcpy(model.weights.conv1_weight, data);
+    } else {
+        std.debug.print("  Warning: conv1_weight not found in checkpoint\n", .{});
+    }
+    if (ckpt.getTensor("conv1_bias")) |data| {
+        @memcpy(model.weights.conv1_bias, data);
+    }
+    if (ckpt.getTensor("conv2_weight")) |data| {
+        @memcpy(model.weights.conv2_weight, data);
+    }
+    if (ckpt.getTensor("conv2_bias")) |data| {
+        @memcpy(model.weights.conv2_bias, data);
+    }
+    if (ckpt.getTensor("fc1_weight")) |data| {
+        @memcpy(model.weights.fc1_weight, data);
+    }
+    if (ckpt.getTensor("fc1_bias")) |data| {
+        @memcpy(model.weights.fc1_bias, data);
+    }
+    if (ckpt.getTensor("fc2_weight")) |data| {
+        @memcpy(model.weights.fc2_weight, data);
+    }
+    if (ckpt.getTensor("fc2_bias")) |data| {
+        @memcpy(model.weights.fc2_bias, data);
+    }
+    if (ckpt.getTensor("fc3_weight")) |data| {
+        @memcpy(model.weights.fc3_weight, data);
+    }
+    if (ckpt.getTensor("fc3_bias")) |data| {
+        @memcpy(model.weights.fc3_bias, data);
+    }
+
+    std.debug.print("  Weights loaded successfully\n\n", .{});
+
+    // Evaluate on test set
+    std.debug.print("Evaluating...\n", .{});
+    const start_time = std.time.Instant.now() catch null;
+
+    var test_correct: usize = 0;
+    var test_total: usize = 0;
+    var test_loss: f32 = 0;
+    const test_batches = test_data.numBatches(args.batch_size);
+
+    for (0..test_batches) |batch_idx| {
+        const batch = test_data.getBatch(batch_idx, args.batch_size);
+        const actual_batch = batch.labels.len;
+
+        _ = model.forward(batch.images, actual_batch);
+        const metrics = model.computeLoss(batch.labels, actual_batch);
+        test_loss += metrics.loss;
+        test_correct += @intFromFloat(metrics.accuracy * @as(f32, @floatFromInt(actual_batch)));
+        test_total += actual_batch;
+    }
+
+    const elapsed_sec: f32 = if (start_time) |st| blk: {
+        const end = std.time.Instant.now() catch st;
+        break :blk @as(f32, @floatFromInt(end.since(st))) / std.time.ns_per_s;
+    } else 0;
+
+    const accuracy = @as(f32, @floatFromInt(test_correct)) / @as(f32, @floatFromInt(test_total));
+    const avg_loss = test_loss / @as(f32, @floatFromInt(test_batches));
+
+    std.debug.print("\nResults:\n", .{});
+    std.debug.print("  Test accuracy: {d:.2}%\n", .{accuracy * 100});
+    std.debug.print("  Test loss: {d:.4}\n", .{avg_loss});
+    std.debug.print("  Samples evaluated: {d}\n", .{test_total});
+    std.debug.print("  Evaluation time: {d:.2}s\n", .{elapsed_sec});
 }
 
 // ============================================================================
