@@ -1,0 +1,32 @@
+[book]
+title = "Tenzor"
+description = "A comptime tensor library for Zig with zero-cost abstractions"
+authors = ["Tenzor Contributors"]
+language = "en"
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/tenzor/tenzor"
+edit-url-template = "https://github.com/tenzor/tenzor/edit/main/docs/{path}"
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.playground]
+editable = false
+
+[output.html.search]
+enable = true
+limit-results = 30
+teaser-word-count = 30
+use-hierarchical-docs = true
+boost-title = 2
+boost-hierarchy = 1
+boost-paragraph = 1
+expand = true
+heading-split-level = 3
