@@ -1263,11 +1263,11 @@ test "eval transpose 4D attention pattern" {
     const Input = Tensor(f32, .{ 1, 2, 2, 3 });
     var input = try Input.fromSlice(std.testing.allocator, &[_]f32{
         // S=0, H=0
-        1, 2, 3,
+        1,  2,  3,
         // S=0, H=1
-        4, 5, 6,
+        4,  5,  6,
         // S=1, H=0
-        7, 8, 9,
+        7,  8,  9,
         // S=1, H=1
         10, 11, 12,
     });
@@ -1305,7 +1305,7 @@ test "eval attention reshape/transpose dance" {
     const Hidden = Tensor(f32, .{ 1, 2, 6 });
     var input = try Hidden.fromSlice(std.testing.allocator, &[_]f32{
         // Token 0: heads interleaved [h0_d0, h0_d1, h0_d2, h1_d0, h1_d1, h1_d2]
-        1, 2, 3, 4, 5, 6,
+        1, 2, 3, 4,  5,  6,
         // Token 1
         7, 8, 9, 10, 11, 12,
     });

@@ -36,6 +36,33 @@ pub fn matmulNaive(
     }
 }
 
+/// Matrix multiplication with transpose_b: C = A @ B^T
+/// A is M x K, B is N x K (stored as [N, K]), C is M x N
+/// Computes A[M,K] @ B[N,K]^T = C[M,N]
+pub fn matmulTransposeB(
+    comptime T: type,
+    a: []const T,
+    b: []const T, // [N, K] will be treated as [K, N]^T
+    c: []T,
+    m: usize,
+    k: usize,
+    n: usize,
+) void {
+    // Initialize C to zero
+    @memset(c, 0);
+
+    for (0..m) |i| {
+        for (0..n) |j| {
+            var sum: T = 0;
+            for (0..k) |kk| {
+                // A[i,kk] * B[j,kk] (B is transposed, so row j in B = column j in B^T)
+                sum += a[i * k + kk] * b[j * k + kk];
+            }
+            c[i * n + j] = sum;
+        }
+    }
+}
+
 /// Tiled matrix multiplication: C = A @ B
 /// Uses blocking for cache efficiency.
 pub fn matmulTiled(
@@ -326,7 +353,7 @@ pub fn batchedMatmulBroadcastB(
         matmulTiled(
             T,
             a[a_offset..][0..a_batch_stride],
-            b[0..k * n],
+            b[0 .. k * n],
             c[c_offset..][0..c_batch_stride],
             m,
             k,
@@ -380,8 +407,8 @@ pub fn batchedMatmulGeneral(
 
         matmulTiled(
             T,
-            a[a_offset..][0..m * k],
-            b[b_offset..][0..k * n],
+            a[a_offset..][0 .. m * k],
+            b[b_offset..][0 .. k * n],
             c[c_offset..][0..c_mat_size],
             m,
             k,
@@ -569,11 +596,11 @@ test "batchedMatmulGeneral multi-batch dims" {
     // Using identity for B, result should equal A
     const a = [_]f32{
         // batch [0,0]
-        1, 2, 3, 4,
+        1,  2,  3,  4,
         // batch [0,1]
-        5, 6, 7, 8,
+        5,  6,  7,  8,
         // batch [1,0]
-        9, 10, 11, 12,
+        9,  10, 11, 12,
         // batch [1,1]
         13, 14, 15, 16,
     };

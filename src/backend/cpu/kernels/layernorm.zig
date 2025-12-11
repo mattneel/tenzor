@@ -260,7 +260,7 @@ test "layernorm transformer pattern" {
     // [B=1, S=2, D=4] normalized over D
     const input = [_]f32{
         // Token 0
-        1.0, 2.0, 3.0, 4.0,
+        1.0,  2.0, 3.0, 4.0,
         // Token 1
         -1.0, 0.0, 1.0, 2.0,
     };

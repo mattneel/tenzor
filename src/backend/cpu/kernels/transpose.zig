@@ -189,11 +189,11 @@ test "transpose 4D attention pattern" {
     // [B=1, S=2, H=2, D=3] -> [B=1, H=2, S=2, D=3] with perm [0, 2, 1, 3]
     const input = [_]f32{
         // S=0, H=0
-        1, 2, 3,
+        1,  2,  3,
         // S=0, H=1
-        4, 5, 6,
+        4,  5,  6,
         // S=1, H=0
-        7, 8, 9,
+        7,  8,  9,
         // S=1, H=1
         10, 11, 12,
     };

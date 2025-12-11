@@ -53,7 +53,7 @@ pub const TensorAllocator = struct {
             self.pool_hits += 1;
             self.allocations += 1;
             self.bytes_allocated += byte_count;
-            return @as([*]T, @alignCast(@ptrCast(buf.ptr)))[0..count];
+            return @as([*]T, @ptrCast(@alignCast(buf.ptr)))[0..count];
         }
 
         // Fall back to backing allocator
@@ -102,7 +102,7 @@ pub const TensorAllocator = struct {
     }
 
     fn allocFn(ctx: *anyopaque, len: usize, ptr_align: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *Self = @alignCast(@ptrCast(ctx));
+        const self: *Self = @ptrCast(@alignCast(ctx));
 
         // Try pool first
         if (self.pool.get(len)) |buf| {
@@ -134,7 +134,7 @@ pub const TensorAllocator = struct {
 
     fn freeFn(ctx: *anyopaque, buf: []u8, buf_align: std.mem.Alignment, ret_addr: usize) void {
         _ = ret_addr;
-        const self: *Self = @alignCast(@ptrCast(ctx));
+        const self: *Self = @ptrCast(@alignCast(ctx));
         self.deallocations += 1;
         self.bytes_freed += buf.len;
         self.pool.putAligned(buf, buf_align);
@@ -221,7 +221,7 @@ pub const ComputeArena = struct {
         if (aligned_offset + byte_count <= self.buffer.len) {
             const ptr = self.buffer[aligned_offset..][0..byte_count];
             self.offset = aligned_offset + byte_count;
-            return @as([*]T, @alignCast(@ptrCast(ptr.ptr)))[0..count];
+            return @as([*]T, @ptrCast(@alignCast(ptr.ptr)))[0..count];
         }
 
         // Fall back to allocator for large allocations
@@ -265,7 +265,7 @@ pub const ComputeArena = struct {
     }
 
     fn arenaAllocFn(ctx: *anyopaque, len: usize, ptr_align: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *Self = @alignCast(@ptrCast(ctx));
+        const self: *Self = @ptrCast(@alignCast(ctx));
         const alignment: usize = @as(usize, 1) << @intFromEnum(ptr_align);
 
         const aligned_offset = std.mem.alignForward(usize, self.offset, alignment);

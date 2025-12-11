@@ -26,8 +26,22 @@ pub const backend = struct {
             pub const elementwise = @import("backend/cpu/kernels/elementwise.zig");
             pub const matmul = @import("backend/cpu/kernels/matmul.zig");
             pub const reduce = @import("backend/cpu/kernels/reduce.zig");
+            pub const softmax = @import("backend/cpu/kernels/softmax.zig");
+            pub const layernorm = @import("backend/cpu/kernels/layernorm.zig");
+            pub const gather = @import("backend/cpu/kernels/gather.zig");
+            pub const transpose = @import("backend/cpu/kernels/transpose.zig");
         };
     };
+};
+
+// I/O and file formats
+pub const io = struct {
+    pub const safetensors = @import("io/safetensors.zig");
+};
+
+// Model implementations
+pub const model = struct {
+    pub const arctic = @import("model/arctic.zig");
 };
 
 // Fusion engine
@@ -84,6 +98,19 @@ test {
     _ = backend.cpu.kernels.elementwise;
     _ = backend.cpu.kernels.matmul;
     _ = backend.cpu.kernels.reduce;
+    _ = backend.cpu.kernels.softmax;
+    _ = backend.cpu.kernels.layernorm;
+    _ = backend.cpu.kernels.gather;
+    _ = backend.cpu.kernels.transpose;
+
+    // I/O tests
+    _ = io.safetensors;
+
+    // Model tests
+    _ = model.arctic;
+
+    // Integration tests
+    _ = @import("tests/arctic_integration_test.zig");
 
     // Fusion tests
     _ = fusion.analyzer;

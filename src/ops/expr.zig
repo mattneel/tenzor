@@ -242,15 +242,15 @@ pub fn UnaryExpr(comptime op: OpTag, comptime Input: type) type {
             return UnaryExpr(.abs, Self).init(self);
         }
 
-        pub fn @"exp"(self: Self) UnaryExpr(.exp, Self) {
+        pub fn exp(self: Self) UnaryExpr(.exp, Self) {
             return UnaryExpr(.exp, Self).init(self);
         }
 
-        pub fn @"log"(self: Self) UnaryExpr(.log, Self) {
+        pub fn log(self: Self) UnaryExpr(.log, Self) {
             return UnaryExpr(.log, Self).init(self);
         }
 
-        pub fn @"sqrt"(self: Self) UnaryExpr(.sqrt, Self) {
+        pub fn sqrt(self: Self) UnaryExpr(.sqrt, Self) {
             return UnaryExpr(.sqrt, Self).init(self);
         }
 
@@ -258,15 +258,15 @@ pub fn UnaryExpr(comptime op: OpTag, comptime Input: type) type {
             return UnaryExpr(.rsqrt, Self).init(self);
         }
 
-        pub fn @"sin"(self: Self) UnaryExpr(.sin, Self) {
+        pub fn sin(self: Self) UnaryExpr(.sin, Self) {
             return UnaryExpr(.sin, Self).init(self);
         }
 
-        pub fn @"cos"(self: Self) UnaryExpr(.cos, Self) {
+        pub fn cos(self: Self) UnaryExpr(.cos, Self) {
             return UnaryExpr(.cos, Self).init(self);
         }
 
-        pub fn @"tanh"(self: Self) UnaryExpr(.tanh, Self) {
+        pub fn tanh(self: Self) UnaryExpr(.tanh, Self) {
             return UnaryExpr(.tanh, Self).init(self);
         }
 
@@ -303,7 +303,7 @@ pub fn UnaryExpr(comptime op: OpTag, comptime Input: type) type {
             return BinaryExpr(.div, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
         }
 
-        pub fn @"pow"(self: Self, other: anytype) BinaryExpr(.pow, Self, AsExpr(@TypeOf(other))) {
+        pub fn pow(self: Self, other: anytype) BinaryExpr(.pow, Self, AsExpr(@TypeOf(other))) {
             return BinaryExpr(.pow, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
         }
 
@@ -405,15 +405,15 @@ pub fn BinaryExpr(comptime op: OpTag, comptime Lhs: type, comptime Rhs: type) ty
             return UnaryExpr(.abs, Self).init(self);
         }
 
-        pub fn @"exp"(self: Self) UnaryExpr(.exp, Self) {
+        pub fn exp(self: Self) UnaryExpr(.exp, Self) {
             return UnaryExpr(.exp, Self).init(self);
         }
 
-        pub fn @"log"(self: Self) UnaryExpr(.log, Self) {
+        pub fn log(self: Self) UnaryExpr(.log, Self) {
             return UnaryExpr(.log, Self).init(self);
         }
 
-        pub fn @"sqrt"(self: Self) UnaryExpr(.sqrt, Self) {
+        pub fn sqrt(self: Self) UnaryExpr(.sqrt, Self) {
             return UnaryExpr(.sqrt, Self).init(self);
         }
 
@@ -421,15 +421,15 @@ pub fn BinaryExpr(comptime op: OpTag, comptime Lhs: type, comptime Rhs: type) ty
             return UnaryExpr(.rsqrt, Self).init(self);
         }
 
-        pub fn @"sin"(self: Self) UnaryExpr(.sin, Self) {
+        pub fn sin(self: Self) UnaryExpr(.sin, Self) {
             return UnaryExpr(.sin, Self).init(self);
         }
 
-        pub fn @"cos"(self: Self) UnaryExpr(.cos, Self) {
+        pub fn cos(self: Self) UnaryExpr(.cos, Self) {
             return UnaryExpr(.cos, Self).init(self);
         }
 
-        pub fn @"tanh"(self: Self) UnaryExpr(.tanh, Self) {
+        pub fn tanh(self: Self) UnaryExpr(.tanh, Self) {
             return UnaryExpr(.tanh, Self).init(self);
         }
 
@@ -466,7 +466,7 @@ pub fn BinaryExpr(comptime op: OpTag, comptime Lhs: type, comptime Rhs: type) ty
             return BinaryExpr(.div, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
         }
 
-        pub fn @"pow"(self: Self, other: anytype) BinaryExpr(.pow, Self, AsExpr(@TypeOf(other))) {
+        pub fn pow(self: Self, other: anytype) BinaryExpr(.pow, Self, AsExpr(@TypeOf(other))) {
             return BinaryExpr(.pow, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
         }
 
@@ -565,7 +565,7 @@ pub fn MatmulExpr(comptime Lhs: type, comptime Rhs: type) type {
             return UnaryExpr(.sigmoid, Self).init(self);
         }
 
-        pub fn @"tanh"(self: Self) UnaryExpr(.tanh, Self) {
+        pub fn tanh(self: Self) UnaryExpr(.tanh, Self) {
             return UnaryExpr(.tanh, Self).init(self);
         }
 
@@ -649,7 +649,7 @@ pub fn ReduceExpr(
             return BinaryExpr(.div, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
         }
 
-        pub fn @"sqrt"(self: Self) UnaryExpr(.sqrt, Self) {
+        pub fn sqrt(self: Self) UnaryExpr(.sqrt, Self) {
             return UnaryExpr(.sqrt, Self).init(self);
         }
 
