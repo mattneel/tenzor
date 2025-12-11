@@ -142,6 +142,7 @@ Draw a digit below and watch Tenzor recognize it in real-time. This runs entirel
     // Downsample 280x280 to 28x28
     const imageData = ctx.getImageData(0, 0, 280, 280);
     const input = new Float32Array(28 * 28);
+    let totalSum = 0;
 
     for (let y = 0; y < 28; y++) {
       for (let x = 0; x < 28; x++) {
@@ -158,7 +159,15 @@ Draw a digit below and watch Tenzor recognize it in real-time. This runs entirel
         }
         // Normalize to [0, 1]
         input[y * 28 + x] = sum / (10 * 10 * 255);
+        totalSum += input[y * 28 + x];
       }
+    }
+
+    // Check if canvas is blank
+    if (totalSum < 5) {
+      result.textContent = '?';
+      confidence.textContent = 'Draw something first';
+      return;
     }
 
     // Copy to WASM memory
