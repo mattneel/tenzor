@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tenzor Performance Benchmarks</title>
+</head>
+<style>
+:root {
+  --bg: #ffffff;
+  --fg: #333333;
+  --card-bg: #f8f9fa;
+  --border: #dee2e6;
+  --primary: #4361ee;
+  --success: #06d6a0;
+  --danger: #ef476f;
+  --warning: #ffd166;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.6;
+  padding: 2rem;
+}
+.container { max-width: 1200px; margin: 0 auto; }
+h1 { margin-bottom: 2rem; font-size: 2rem; }
+h2 { margin: 2rem 0 1rem; font-size: 1.5rem; border-bottom: 2px solid var(--primary); padding-bottom: 0.5rem; }
+h3 { margin: 1rem 0 0.5rem; font-size: 1.1rem; }
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+th, td { padding: 0.75rem; text-align: left; border-bottom: 1px solid var(--border); }
+th { font-weight: 600; background: var(--card-bg); }
+tr:hover { background: var(--card-bg); }
+.metric { font-family: 'SF Mono', 'Consolas', monospace; }
+.improved { color: var(--success); }
+.regressed { color: var(--danger); }
+.noisy { color: var(--warning); }
+.svg-container { margin: 1rem 0; }
+svg { max-width: 100%; height: auto; }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1rem; }
+.stat-box { text-align: center; padding: 1rem; background: var(--bg); border-radius: 4px; }
+.stat-value { font-size: 1.5rem; font-weight: bold; color: var(--primary); }
+.stat-label { font-size: 0.875rem; opacity: 0.8; }
+</style>
+<body>
+<div class="container">
+<h1>Tenzor Performance Benchmarks</h1>
+<div class="card">
+<h2>Summary</h2>
+<table>
+<thead><tr><th>Benchmark</th><th>Median</th><th>Mean</th><th>Std Dev</th><th>Samples</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>[Matrix Multiplication] matmul_naive_64x64x64</td><td class="metric">7.47 μs</td><td class="metric">7.56 μs</td><td class="metric">350 ns</td><td>500</td><td>-</td></tr>
+<tr><td>[Matrix Multiplication] matmul_tiled_64x64x64</td><td class="metric">7.52 μs</td><td class="metric">7.70 μs</td><td class="metric">1.87 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Matrix Multiplication] matmul_naive_256x256x256</td><td class="metric">698.44 μs</td><td class="metric">699.78 μs</td><td class="metric">6.97 μs</td><td>79</td><td>-</td></tr>
+<tr><td>[Matrix Multiplication] matmul_tiled_256x256x256</td><td class="metric">463.52 μs</td><td class="metric">463.93 μs</td><td class="metric">2.98 μs</td><td>30</td><td>-</td></tr>
+<tr><td>[Matrix Multiplication] matmul_parallel_256x256x256</td><td class="metric">1.05 ms</td><td class="metric">1.07 ms</td><td class="metric">92.87 μs</td><td>462</td><td>-</td></tr>
+<tr><td>[Matrix Multiplication] matmul_tiled_512x512x512</td><td class="metric">6.27 ms</td><td class="metric">6.28 ms</td><td class="metric">62.67 μs</td><td>69</td><td>-</td></tr>
+<tr><td>[Matrix Multiplication] matmul_parallel_512x512x512</td><td class="metric">3.60 ms</td><td class="metric">3.60 ms</td><td class="metric">356.16 μs</td><td>139</td><td>-</td></tr>
+<tr><td>[Matrix Multiplication] matmul_tiled_384x512x384</td><td class="metric">2.13 ms</td><td class="metric">2.13 ms</td><td class="metric">21.13 μs</td><td>44</td><td>-</td></tr>
+<tr><td>[Matrix Multiplication] matmul_parallel_384x512x384</td><td class="metric">2.34 ms</td><td class="metric">2.33 ms</td><td class="metric">171.49 μs</td><td>215</td><td>-</td></tr>
+<tr><td>[Convolution 2D] conv2d_lenet1_b1</td><td class="metric">6.30 μs</td><td class="metric">6.76 μs</td><td class="metric">1.09 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Convolution 2D] conv2d_lenet1_b64</td><td class="metric">447.65 μs</td><td class="metric">450.87 μs</td><td class="metric">11.63 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Convolution 2D] conv2d_lenet2_b1</td><td class="metric">37.74 μs</td><td class="metric">38.33 μs</td><td class="metric">1.40 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Convolution 2D] conv2d_lenet2_b64</td><td class="metric">2.39 ms</td><td class="metric">2.40 ms</td><td class="metric">37.50 μs</td><td>209</td><td>-</td></tr>
+<tr><td>[Convolution 2D] conv2d_64x56x56_3x3</td><td class="metric">35.73 ms</td><td class="metric">35.74 ms</td><td class="metric">153.63 μs</td><td>30</td><td>-</td></tr>
+<tr><td>[Elementwise] relu_64K</td><td class="metric">13.20 μs</td><td class="metric">13.30 μs</td><td class="metric">521 ns</td><td>500</td><td>-</td></tr>
+<tr><td>[Elementwise] exp_64K</td><td class="metric">232.74 μs</td><td class="metric">235.43 μs</td><td class="metric">7.29 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Elementwise] tanh_64K</td><td class="metric">286.39 μs</td><td class="metric">289.01 μs</td><td class="metric">7.50 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Elementwise] relu_1M</td><td class="metric">328.28 μs</td><td class="metric">338.62 μs</td><td class="metric">21.88 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Elementwise] exp_1M</td><td class="metric">3.74 ms</td><td class="metric">3.75 ms</td><td class="metric">77.77 μs</td><td>133</td><td>-</td></tr>
+<tr><td>[Elementwise] tanh_1M</td><td class="metric">4.51 ms</td><td class="metric">4.53 ms</td><td class="metric">79.36 μs</td><td>111</td><td>-</td></tr>
+<tr><td>[Elementwise] add_64K</td><td class="metric">20.96 μs</td><td class="metric">21.48 μs</td><td class="metric">2.27 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Elementwise] mul_64K</td><td class="metric">20.69 μs</td><td class="metric">21.54 μs</td><td class="metric">7.50 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Elementwise] add_1M</td><td class="metric">491.81 μs</td><td class="metric">506.93 μs</td><td class="metric">39.79 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Elementwise] mul_1M</td><td class="metric">489.26 μs</td><td class="metric">501.52 μs</td><td class="metric">36.56 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Reductions] sum_64K</td><td class="metric">7.74 μs</td><td class="metric">8.00 μs</td><td class="metric">918 ns</td><td>500</td><td>-</td></tr>
+<tr><td>[Reductions] max_64K</td><td class="metric">18.55 μs</td><td class="metric">18.64 μs</td><td class="metric">120 ns</td><td>30</td><td>-</td></tr>
+<tr><td>[Reductions] mean_64K</td><td class="metric">7.73 μs</td><td class="metric">7.81 μs</td><td class="metric">390 ns</td><td>500</td><td>-</td></tr>
+<tr><td>[Reductions] sum_1M</td><td class="metric">149.61 μs</td><td class="metric">152.33 μs</td><td class="metric">10.22 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Reductions] max_1M</td><td class="metric">306.91 μs</td><td class="metric">309.68 μs</td><td class="metric">9.46 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Reductions] mean_1M</td><td class="metric">149.68 μs</td><td class="metric">152.58 μs</td><td class="metric">6.27 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Reductions] argmax_64K</td><td class="metric">52.58 μs</td><td class="metric">52.63 μs</td><td class="metric">289 ns</td><td>30</td><td>-</td></tr>
+<tr><td>[Reductions] argmax_1M</td><td class="metric">838.03 μs</td><td class="metric">842.28 μs</td><td class="metric">15.28 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Softmax] softmax_64x64</td><td class="metric">19.78 μs</td><td class="metric">19.91 μs</td><td class="metric">612 ns</td><td>500</td><td>-</td></tr>
+<tr><td>[Softmax] softmax_128x128</td><td class="metric">80.66 μs</td><td class="metric">81.54 μs</td><td class="metric">3.38 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Softmax] softmax_256x256</td><td class="metric">321.02 μs</td><td class="metric">321.57 μs</td><td class="metric">2.55 μs</td><td>30</td><td>-</td></tr>
+<tr><td>[Softmax] softmax_512x512</td><td class="metric">1.30 ms</td><td class="metric">1.31 ms</td><td class="metric">22.83 μs</td><td>382</td><td>-</td></tr>
+<tr><td>[Softmax] softmax_64x384</td><td class="metric">120.03 μs</td><td class="metric">121.13 μs</td><td class="metric">2.80 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Softmax] softmax_256x768</td><td class="metric">986.25 μs</td><td class="metric">991.29 μs</td><td class="metric">14.78 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Layer Normalization] layernorm_128x384</td><td class="metric">12.53 μs</td><td class="metric">12.67 μs</td><td class="metric">644 ns</td><td>500</td><td>-</td></tr>
+<tr><td>[Layer Normalization] layernorm_512x384</td><td class="metric">54.26 μs</td><td class="metric">55.75 μs</td><td class="metric">5.26 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Layer Normalization] layernorm_128x768</td><td class="metric">26.28 μs</td><td class="metric">26.28 μs</td><td class="metric">37 ns</td><td>30</td><td>-</td></tr>
+<tr><td>[Layer Normalization] layernorm_512x768</td><td class="metric">106.25 μs</td><td class="metric">109.17 μs</td><td class="metric">5.78 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[Layer Normalization] layernorm_1x384</td><td class="metric">108 ns</td><td class="metric">108 ns</td><td class="metric">1 ns</td><td>145</td><td>-</td></tr>
+<tr><td>[Layer Normalization] layernorm_1x768</td><td class="metric">234 ns</td><td class="metric">235 ns</td><td class="metric">25 ns</td><td>500</td><td>-</td></tr>
+<tr><td>[LeNet-5 Model] lenet_forward_b1</td><td class="metric">442.72 μs</td><td class="metric">445.46 μs</td><td class="metric">7.84 μs</td><td>500</td><td>-</td></tr>
+<tr><td>[LeNet-5 Model] lenet_forward_b16</td><td class="metric">1.40 ms</td><td class="metric">1.41 ms</td><td class="metric">17.49 μs</td><td>354</td><td>-</td></tr>
+<tr><td>[LeNet-5 Model] lenet_forward_b64</td><td class="metric">4.48 ms</td><td class="metric">4.49 ms</td><td class="metric">28.18 μs</td><td>30</td><td>-</td></tr>
+<tr><td>[LeNet-5 Model] lenet_train_b16</td><td class="metric">3.17 ms</td><td class="metric">3.17 ms</td><td class="metric">29.15 μs</td><td>30</td><td>-</td></tr>
+<tr><td>[LeNet-5 Model] lenet_train_b64</td><td class="metric">11.98 ms</td><td class="metric">11.97 ms</td><td class="metric">70.13 μs</td><td>30</td><td>-</td></tr>
+<tr><td>[Thread Scaling] scaling_matmul_t1</td><td class="metric">14.79 ms</td><td class="metric">14.80 ms</td><td class="metric">59.21 μs</td><td>30</td><td>-</td></tr>
+<tr><td>[Thread Scaling] scaling_matmul_t2</td><td class="metric">9.25 ms</td><td class="metric">10.69 ms</td><td class="metric">2.55 ms</td><td>47</td><td>-</td></tr>
+<tr><td>[Thread Scaling] scaling_matmul_t4</td><td class="metric">8.12 ms</td><td class="metric">7.59 ms</td><td class="metric">1.08 ms</td><td>66</td><td>-</td></tr>
+<tr><td>[Thread Scaling] scaling_matmul_t8</td><td class="metric">4.89 ms</td><td class="metric">4.62 ms</td><td class="metric">602.00 μs</td><td>109</td><td>-</td></tr>
+</tbody></table>
+</div>
+<div class="card" id="bench-[Matrix Multiplication] matmul_naive_64x64x64">
+<h2>[Matrix Multiplication] matmul_naive_64x64x64</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">7.41 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">7.47 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">11.20 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">4.64%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">99</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Matrix Multiplication] matmul_tiled_64x64x64">
+<h2>[Matrix Multiplication] matmul_tiled_64x64x64</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">7.41 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">7.52 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">48.59 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">24.25%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">119</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Matrix Multiplication] matmul_naive_256x256x256">
+<h2>[Matrix Multiplication] matmul_naive_256x256x256</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">684.28 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">698.44 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">733.98 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">1.00%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">6</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">79</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Matrix Multiplication] matmul_tiled_256x256x256">
+<h2>[Matrix Multiplication] matmul_tiled_256x256x256</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">461.74 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">463.52 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">474.97 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">0.64%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">3</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">30</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Matrix Multiplication] matmul_parallel_256x256x256">
+<h2>[Matrix Multiplication] matmul_parallel_256x256x256</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">918.17 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">1.05 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">1.64 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">8.66%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">15</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">462</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Matrix Multiplication] matmul_tiled_512x512x512">
+<h2>[Matrix Multiplication] matmul_tiled_512x512x512</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">6.18 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">6.27 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">6.50 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">1.00%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">4</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">69</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Matrix Multiplication] matmul_parallel_512x512x512">
+<h2>[Matrix Multiplication] matmul_parallel_512x512x512</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">2.83 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">3.60 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">4.58 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">9.90%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">0</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">139</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Matrix Multiplication] matmul_tiled_384x512x384">
+<h2>[Matrix Multiplication] matmul_tiled_384x512x384</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">2.11 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">2.13 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">2.21 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">0.99%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">1</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">44</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Matrix Multiplication] matmul_parallel_384x512x384">
+<h2>[Matrix Multiplication] matmul_parallel_384x512x384</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">1.93 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">2.34 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">2.87 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">7.37%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">3</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">215</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Convolution 2D] conv2d_lenet1_b1">
+<h2>[Convolution 2D] conv2d_lenet1_b1</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">6.03 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">6.30 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">25.79 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">16.10%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">8</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Convolution 2D] conv2d_lenet1_b64">
+<h2>[Convolution 2D] conv2d_lenet1_b64</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">440.11 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">447.65 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">540.20 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">2.58%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">33</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Convolution 2D] conv2d_lenet2_b1">
+<h2>[Convolution 2D] conv2d_lenet2_b1</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">37.63 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">37.74 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">53.82 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">3.64%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">76</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Convolution 2D] conv2d_lenet2_b64">
+<h2>[Convolution 2D] conv2d_lenet2_b64</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">2.34 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">2.39 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">2.54 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">1.56%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">3</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">209</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Convolution 2D] conv2d_64x56x56_3x3">
+<h2>[Convolution 2D] conv2d_64x56x56_3x3</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">35.46 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">35.73 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">36.06 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">0.43%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">0</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">30</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Elementwise] relu_64K">
+<h2>[Elementwise] relu_64K</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">13.04 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">13.20 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">18.89 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">3.92%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">37</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Elementwise] exp_64K">
+<h2>[Elementwise] exp_64K</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">230.61 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">232.74 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">300.40 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">3.10%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">22</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Elementwise] tanh_64K">
+<h2>[Elementwise] tanh_64K</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">283.27 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">286.39 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">360.15 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">2.60%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">32</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Elementwise] relu_1M">
+<h2>[Elementwise] relu_1M</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">320.64 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">328.28 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">444.71 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">6.46%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">13</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Elementwise] exp_1M">
+<h2>[Elementwise] exp_1M</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">3.62 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">3.74 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">4.23 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">2.07%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">5</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">133</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Elementwise] tanh_1M">
+<h2>[Elementwise] tanh_1M</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">4.42 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">4.51 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">4.86 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">1.75%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">2</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">111</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Elementwise] add_64K">
+<h2>[Elementwise] add_64K</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">20.55 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">20.96 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">56.62 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">10.57%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">25</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Elementwise] mul_64K">
+<h2>[Elementwise] mul_64K</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">20.48 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">20.69 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">165.01 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">34.80%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">92</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Elementwise] add_1M">
+<h2>[Elementwise] add_1M</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">463.67 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">491.81 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">630.47 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">7.85%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">0</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Elementwise] mul_1M">
+<h2>[Elementwise] mul_1M</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">463.49 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">489.26 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">635.83 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">7.29%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">9</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Reductions] sum_64K">
+<h2>[Reductions] sum_64K</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">7.70 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">7.74 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">21.55 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">11.48%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">15</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Reductions] max_64K">
+<h2>[Reductions] max_64K</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">18.50 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">18.55 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">18.86 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">0.65%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">0</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">30</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Reductions] mean_64K">
+<h2>[Reductions] mean_64K</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">7.71 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">7.73 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">14.90 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">5.00%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">98</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Reductions] sum_1M">
+<h2>[Reductions] sum_1M</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">147.14 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">149.61 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">280.37 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">6.71%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">15</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Reductions] max_1M">
+<h2>[Reductions] max_1M</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">300.71 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">306.91 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">382.04 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">3.05%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">23</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Reductions] mean_1M">
+<h2>[Reductions] mean_1M</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">147.12 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">149.68 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">185.73 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">4.11%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">5</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Reductions] argmax_64K">
+<h2>[Reductions] argmax_64K</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">52.53 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">52.58 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">54.19 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">0.55%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">1</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">30</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Reductions] argmax_1M">
+<h2>[Reductions] argmax_1M</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">813.77 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">838.03 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">929.50 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">1.81%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">39</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Softmax] softmax_64x64">
+<h2>[Softmax] softmax_64x64</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">19.71 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">19.78 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">29.72 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">3.07%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">58</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Softmax] softmax_128x128">
+<h2>[Softmax] softmax_128x128</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">80.53 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">80.66 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">137.52 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">4.15%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">96</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Softmax] softmax_256x256">
+<h2>[Softmax] softmax_256x256</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">319.29 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">321.02 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">328.65 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">0.79%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">2</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">30</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Softmax] softmax_512x512">
+<h2>[Softmax] softmax_512x512</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">1.28 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">1.30 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">1.40 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">1.75%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">30</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">382</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Softmax] softmax_64x384">
+<h2>[Softmax] softmax_64x384</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">119.83 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">120.03 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">162.20 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">2.31%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">51</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Softmax] softmax_256x768">
+<h2>[Softmax] softmax_256x768</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">976.05 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">986.25 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">1.05 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">1.49%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">35</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Layer Normalization] layernorm_128x384">
+<h2>[Layer Normalization] layernorm_128x384</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">12.46 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">12.53 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">19.68 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">5.08%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">73</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Layer Normalization] layernorm_512x384">
+<h2>[Layer Normalization] layernorm_512x384</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">54.04 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">54.26 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">136.56 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">9.43%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">19</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Layer Normalization] layernorm_128x768">
+<h2>[Layer Normalization] layernorm_128x768</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">26.21 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">26.28 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">26.38 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">0.14%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">1</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">30</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Layer Normalization] layernorm_512x768">
+<h2>[Layer Normalization] layernorm_512x768</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">104.87 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">106.25 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">156.27 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">5.29%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">15</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Layer Normalization] layernorm_1x384">
+<h2>[Layer Normalization] layernorm_1x384</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">107 ns</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">108 ns</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">118 ns</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">1.00%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">1</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">145</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Layer Normalization] layernorm_1x768">
+<h2>[Layer Normalization] layernorm_1x768</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">230 ns</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">234 ns</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">775 ns</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">10.69%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">37</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[LeNet-5 Model] lenet_forward_b1">
+<h2>[LeNet-5 Model] lenet_forward_b1</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">440.05 μs</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">442.72 μs</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">529.41 μs</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">1.76%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">41</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">500</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[LeNet-5 Model] lenet_forward_b16">
+<h2>[LeNet-5 Model] lenet_forward_b16</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">1.39 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">1.40 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">1.50 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">1.24%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">20</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">354</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[LeNet-5 Model] lenet_forward_b64">
+<h2>[LeNet-5 Model] lenet_forward_b64</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">4.44 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">4.48 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">4.53 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">0.63%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">0</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">30</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[LeNet-5 Model] lenet_train_b16">
+<h2>[LeNet-5 Model] lenet_train_b16</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">3.11 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">3.17 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">3.24 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">0.92%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">0</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">30</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[LeNet-5 Model] lenet_train_b64">
+<h2>[LeNet-5 Model] lenet_train_b64</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">11.86 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">11.98 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">12.12 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">0.59%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">0</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">30</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Thread Scaling] scaling_matmul_t1">
+<h2>[Thread Scaling] scaling_matmul_t1</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">14.68 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">14.79 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">14.95 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">0.40%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">2</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">30</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Thread Scaling] scaling_matmul_t2">
+<h2>[Thread Scaling] scaling_matmul_t2</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">7.95 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">9.25 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">16.25 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">23.81%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">0</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">47</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Thread Scaling] scaling_matmul_t4">
+<h2>[Thread Scaling] scaling_matmul_t4</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">5.08 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">8.12 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">9.76 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">14.22%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">0</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">66</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+<div class="card" id="bench-[Thread Scaling] scaling_matmul_t8">
+<h2>[Thread Scaling] scaling_matmul_t8</h2>
+<div class="stats-grid">
+<div class="stat-box"><div class="stat-value">3.36 ms</div><div class="stat-label">Min</div></div>
+<div class="stat-box"><div class="stat-value">4.89 ms</div><div class="stat-label">Median</div></div>
+<div class="stat-box"><div class="stat-value">5.76 ms</div><div class="stat-label">Max</div></div>
+<div class="stat-box"><div class="stat-value">13.03%</div><div class="stat-label">CV</div></div>
+<div class="stat-box"><div class="stat-value">0</div><div class="stat-label">Outliers</div></div>
+<div class="stat-box"><div class="stat-value">109</div><div class="stat-label">Samples</div></div>
+</div>
+</div>
+</div>
+<script>
+// Interactive features
+document.querySelectorAll('th').forEach(th => {
+  th.style.cursor = 'pointer';
+  th.addEventListener('click', () => sortTable(th));
+});
+
+function sortTable(header) {
+  const table = header.closest('table');
+  const tbody = table.querySelector('tbody');
+  const rows = Array.from(tbody.querySelectorAll('tr'));
+  const idx = Array.from(header.parentNode.children).indexOf(header);
+  const asc = header.dataset.sort !== 'asc';
+
+  rows.sort((a, b) => {
+    const aVal = a.children[idx].textContent;
+    const bVal = b.children[idx].textContent;
+    const aNum = parseFloat(aVal) || 0;
+    const bNum = parseFloat(bVal) || 0;
+    if (!isNaN(aNum) && !isNaN(bNum)) {
+      return asc ? aNum - bNum : bNum - aNum;
+    }
+    return asc ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+  });
+
+  header.dataset.sort = asc ? 'asc' : 'desc';
+  rows.forEach(row => tbody.appendChild(row));
+}
+
+// Print timestamp
+document.querySelector('h1').insertAdjacentHTML('afterend',
+  '<p style="opacity:0.6;font-size:0.875rem">Generated: ' + new Date().toISOString() + '</p>');
+</script>
+</body>
+</html>

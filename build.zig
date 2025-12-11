@@ -191,6 +191,25 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| bench_run.addArgs(args);
     bench_step.dependOn(&bench_run.step);
 
+    // Benchmark HTML report generator
+    const bench_report_exe = b.addExecutable(.{
+        .name = "tenzor-bench-report",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/src/report.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "tenzor", .module = mod },
+                .{ .name = "ziterion", .module = ziterion.module("ziterion") },
+            },
+        }),
+    });
+
+    const bench_report_step = b.step("bench-report", "Generate HTML benchmark report");
+    const bench_report_run = b.addRunArtifact(bench_report_exe);
+    bench_report_run.addArg("docs/src/appendix/benchmarks-report.html");
+    bench_report_step.dependOn(&bench_report_run.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
