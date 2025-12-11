@@ -186,24 +186,32 @@ fn conv2d(
     const out_h = in_h - k + 1;
     const out_w = in_w - k + 1;
 
-    for (0..out_c) |oc| {
-        for (0..out_h) |oh| {
-            for (0..out_w) |ow| {
+    // Input layout: [H, W, C] (HWC for single image)
+    // Weight layout: [C_out, kH, kW, C_in]
+    // Output layout: [H, W, C_out]
+
+    for (0..out_h) |oh| {
+        for (0..out_w) |ow| {
+            for (0..out_c) |oc| {
                 var sum: f32 = bias[oc];
 
-                for (0..in_c) |ic| {
-                    for (0..k) |kh| {
-                        for (0..k) |kw| {
-                            const ih = oh + kh;
-                            const iw = ow + kw;
-                            const inp_idx = ic * in_h * in_w + ih * in_w + iw;
-                            const w_idx = oc * in_c * k * k + ic * k * k + kh * k + kw;
+                for (0..k) |kh| {
+                    for (0..k) |kw| {
+                        const ih = oh + kh;
+                        const iw = ow + kw;
+
+                        for (0..in_c) |ic| {
+                            // HWC input layout
+                            const inp_idx = (ih * in_w + iw) * in_c + ic;
+                            // Weight layout: [out_c, kh, kw, in_c]
+                            const w_idx = ((oc * k + kh) * k + kw) * in_c + ic;
                             sum += inp[inp_idx] * weight[w_idx];
                         }
                     }
                 }
 
-                out[oc * out_h * out_w + oh * out_w + ow] = sum;
+                // HWC output layout
+                out[(oh * out_w + ow) * out_c + oc] = sum;
             }
         }
     }
@@ -213,19 +221,20 @@ fn maxpool2d(inp: []const f32, out: []f32, channels: usize, in_h: usize, in_w: u
     const out_h = in_h / 2;
     const out_w = in_w / 2;
 
-    for (0..channels) |c| {
-        for (0..out_h) |oh| {
-            for (0..out_w) |ow| {
-                const ih = oh * 2;
-                const iw = ow * 2;
-                const base = c * in_h * in_w;
+    // HWC layout
+    for (0..out_h) |oh| {
+        for (0..out_w) |ow| {
+            const ih = oh * 2;
+            const iw = ow * 2;
 
-                var max_val: f32 = inp[base + ih * in_w + iw];
-                max_val = @max(max_val, inp[base + ih * in_w + iw + 1]);
-                max_val = @max(max_val, inp[base + (ih + 1) * in_w + iw]);
-                max_val = @max(max_val, inp[base + (ih + 1) * in_w + iw + 1]);
+            for (0..channels) |c| {
+                // Sample 2x2 window in HWC layout
+                const v00 = inp[(ih * in_w + iw) * channels + c];
+                const v01 = inp[(ih * in_w + iw + 1) * channels + c];
+                const v10 = inp[((ih + 1) * in_w + iw) * channels + c];
+                const v11 = inp[((ih + 1) * in_w + iw + 1) * channels + c];
 
-                out[c * out_h * out_w + oh * out_w + ow] = max_val;
+                out[(oh * out_w + ow) * channels + c] = @max(@max(v00, v01), @max(v10, v11));
             }
         }
     }
