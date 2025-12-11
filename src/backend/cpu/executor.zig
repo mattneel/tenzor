@@ -17,6 +17,7 @@ const kernels = struct {
     const softmax = @import("kernels/softmax.zig");
     const layernorm = @import("kernels/layernorm.zig");
     const gather = @import("kernels/gather.zig");
+    const transpose = @import("kernels/transpose.zig");
 };
 
 const Tensor = core.tensor.Tensor;
@@ -82,8 +83,11 @@ pub fn evalInto(
         .gather => {
             try evalGather(Expr, expr, output, allocator);
         },
-        else => {
-            @compileError("Unsupported expression kind: " ++ @tagName(Expr.kind));
+        .reshape => {
+            try evalReshape(Expr, expr, output, allocator);
+        },
+        .transpose => {
+            try evalTranspose(Expr, expr, output, allocator);
         },
     }
 }
@@ -470,6 +474,69 @@ fn getIndicesData(
             @compileError("Gather indices must be tensor type, not computed expression");
         },
     }
+}
+
+/// Evaluate a reshape expression.
+/// Reshape is a no-op on the data - just a reinterpretation of shape.
+fn evalReshape(
+    comptime Expr: type,
+    expr: Expr,
+    output: []Expr.ElementType,
+    allocator: std.mem.Allocator,
+) !void {
+    const Input = Expr.InputType;
+
+    // Get input data
+    const input_data = try getInputData(Input, expr.input, allocator);
+    defer if (input_data.allocated) allocator.free(input_data.data);
+
+    // Just copy (reshape doesn't change data layout for contiguous tensors)
+    @memcpy(output, input_data.data);
+}
+
+/// Evaluate a transpose expression.
+fn evalTranspose(
+    comptime Expr: type,
+    expr: Expr,
+    output: []Expr.ElementType,
+    allocator: std.mem.Allocator,
+) !void {
+    const T = Expr.ElementType;
+    const Input = Expr.InputType;
+
+    // Get input data
+    const input_data = try getInputData(Input, expr.input, allocator);
+    defer if (input_data.allocated) allocator.free(input_data.data);
+
+    // Check for optimized 4D attention transpose [B, S, H, D] -> [B, H, S, D]
+    if (Expr.ndim == 4 and
+        Expr.permutation[0] == 0 and
+        Expr.permutation[1] == 2 and
+        Expr.permutation[2] == 1 and
+        Expr.permutation[3] == 3)
+    {
+        const in_shape = Input.shape;
+        kernels.transpose.transpose4D_0213(
+            T,
+            input_data.data,
+            output,
+            in_shape[0], // B
+            in_shape[1], // S
+            in_shape[2], // H
+            in_shape[3], // D
+        );
+        return;
+    }
+
+    // General case
+    kernels.transpose.transpose(
+        T,
+        Expr.ndim,
+        input_data.data,
+        output,
+        Input.shape,
+        Expr.permutation,
+    );
 }
 
 /// Result of getting input data - tracks whether we allocated.
@@ -1141,4 +1208,140 @@ test "eval gather chained with matmul" {
     for (result.slice(), gather_only.slice()) |r, g| {
         try std.testing.expectApproxEqAbs(r, g, 1e-5);
     }
+}
+
+test "eval reshape" {
+    const Vec = Tensor(f32, .{6});
+    var input = try Vec.fromSlice(std.testing.allocator, &[_]f32{ 1, 2, 3, 4, 5, 6 });
+    defer input.deinit();
+
+    const ReshapeExpr = ops.ReshapeExpr(Vec, .{ 2, 3 });
+    const expr = ReshapeExpr.init(input);
+
+    // Shape should change
+    try std.testing.expectEqual(@as(usize, 2), ReshapeExpr.ndim);
+    try std.testing.expectEqual(@as(usize, 2), ReshapeExpr.shape[0]);
+    try std.testing.expectEqual(@as(usize, 3), ReshapeExpr.shape[1]);
+
+    var result = try eval(ReshapeExpr, expr, std.testing.allocator);
+    defer result.deinit();
+
+    // Data should be unchanged
+    try std.testing.expectEqualSlices(f32, input.slice(), result.slice());
+}
+
+test "eval transpose 2D" {
+    const Mat = Tensor(f32, .{ 2, 3 });
+    var input = try Mat.fromSlice(std.testing.allocator, &[_]f32{
+        1, 2, 3,
+        4, 5, 6,
+    });
+    defer input.deinit();
+
+    const TransposeExpr = ops.TransposeExpr(Mat, .{ 1, 0 });
+    const expr = TransposeExpr.init(input);
+
+    // Shape should be swapped
+    try std.testing.expectEqual(@as(usize, 2), TransposeExpr.ndim);
+    try std.testing.expectEqual(@as(usize, 3), TransposeExpr.shape[0]);
+    try std.testing.expectEqual(@as(usize, 2), TransposeExpr.shape[1]);
+
+    var result = try eval(TransposeExpr, expr, std.testing.allocator);
+    defer result.deinit();
+
+    // Expected: [[1, 4], [2, 5], [3, 6]]
+    try std.testing.expectEqual(@as(f32, 1), result.slice()[0]);
+    try std.testing.expectEqual(@as(f32, 4), result.slice()[1]);
+    try std.testing.expectEqual(@as(f32, 2), result.slice()[2]);
+    try std.testing.expectEqual(@as(f32, 5), result.slice()[3]);
+    try std.testing.expectEqual(@as(f32, 3), result.slice()[4]);
+    try std.testing.expectEqual(@as(f32, 6), result.slice()[5]);
+}
+
+test "eval transpose 4D attention pattern" {
+    // [B=1, S=2, H=2, D=3] -> [B=1, H=2, S=2, D=3]
+    const Input = Tensor(f32, .{ 1, 2, 2, 3 });
+    var input = try Input.fromSlice(std.testing.allocator, &[_]f32{
+        // S=0, H=0
+        1, 2, 3,
+        // S=0, H=1
+        4, 5, 6,
+        // S=1, H=0
+        7, 8, 9,
+        // S=1, H=1
+        10, 11, 12,
+    });
+    defer input.deinit();
+
+    const TransposeExpr = ops.TransposeExpr(Input, .{ 0, 2, 1, 3 });
+    const expr = TransposeExpr.init(input);
+
+    // Shape: [1, 2, 2, 3]
+    try std.testing.expectEqual(@as(usize, 4), TransposeExpr.ndim);
+    try std.testing.expectEqual(@as(usize, 1), TransposeExpr.shape[0]);
+    try std.testing.expectEqual(@as(usize, 2), TransposeExpr.shape[1]); // H moved here
+    try std.testing.expectEqual(@as(usize, 2), TransposeExpr.shape[2]); // S moved here
+    try std.testing.expectEqual(@as(usize, 3), TransposeExpr.shape[3]);
+
+    var result = try eval(TransposeExpr, expr, std.testing.allocator);
+    defer result.deinit();
+
+    // Output layout: H=0 (S=0: 1,2,3; S=1: 7,8,9), H=1 (S=0: 4,5,6; S=1: 10,11,12)
+    try std.testing.expectEqual(@as(f32, 1), result.slice()[0]);
+    try std.testing.expectEqual(@as(f32, 2), result.slice()[1]);
+    try std.testing.expectEqual(@as(f32, 3), result.slice()[2]);
+    try std.testing.expectEqual(@as(f32, 7), result.slice()[3]);
+    try std.testing.expectEqual(@as(f32, 8), result.slice()[4]);
+    try std.testing.expectEqual(@as(f32, 9), result.slice()[5]);
+    try std.testing.expectEqual(@as(f32, 4), result.slice()[6]);
+    try std.testing.expectEqual(@as(f32, 10), result.slice()[9]);
+}
+
+test "eval attention reshape/transpose dance" {
+    // This is the critical test the user flagged
+    // [B, S, D] -> [B, S, H, D_h] -> [B, H, S, D_h]
+    // B=1, S=2, D=6, H=2, D_h=3
+
+    const Hidden = Tensor(f32, .{ 1, 2, 6 });
+    var input = try Hidden.fromSlice(std.testing.allocator, &[_]f32{
+        // Token 0: heads interleaved [h0_d0, h0_d1, h0_d2, h1_d0, h1_d1, h1_d2]
+        1, 2, 3, 4, 5, 6,
+        // Token 1
+        7, 8, 9, 10, 11, 12,
+    });
+    defer input.deinit();
+
+    // Step 1: Reshape [1, 2, 6] -> [1, 2, 2, 3]
+    const ReshapeExpr = ops.ReshapeExpr(Hidden, .{ 1, 2, 2, 3 });
+    const reshaped = ReshapeExpr.init(input);
+
+    // Step 2: Transpose [1, 2, 2, 3] -> [1, 2, 2, 3] with perm [0, 2, 1, 3]
+    const TransposeExpr = ops.TransposeExpr(ReshapeExpr, .{ 0, 2, 1, 3 });
+    const transposed = reshaped.transpose(.{ 0, 2, 1, 3 });
+
+    var result = try eval(TransposeExpr, transposed, std.testing.allocator);
+    defer result.deinit();
+
+    // Shape should be [B=1, H=2, S=2, D_h=3]
+    try std.testing.expectEqual(@as(usize, 4), TransposeExpr.ndim);
+    try std.testing.expectEqual(@as(usize, 1), TransposeExpr.shape[0]);
+    try std.testing.expectEqual(@as(usize, 2), TransposeExpr.shape[1]);
+    try std.testing.expectEqual(@as(usize, 2), TransposeExpr.shape[2]);
+    try std.testing.expectEqual(@as(usize, 3), TransposeExpr.shape[3]);
+
+    // After reshape+transpose:
+    // Head 0: Token 0 (1,2,3), Token 1 (7,8,9)
+    // Head 1: Token 0 (4,5,6), Token 1 (10,11,12)
+    try std.testing.expectEqual(@as(f32, 1), result.slice()[0]);
+    try std.testing.expectEqual(@as(f32, 2), result.slice()[1]);
+    try std.testing.expectEqual(@as(f32, 3), result.slice()[2]);
+    try std.testing.expectEqual(@as(f32, 7), result.slice()[3]);
+    try std.testing.expectEqual(@as(f32, 8), result.slice()[4]);
+    try std.testing.expectEqual(@as(f32, 9), result.slice()[5]);
+    try std.testing.expectEqual(@as(f32, 4), result.slice()[6]);
+    try std.testing.expectEqual(@as(f32, 5), result.slice()[7]);
+    try std.testing.expectEqual(@as(f32, 6), result.slice()[8]);
+    try std.testing.expectEqual(@as(f32, 10), result.slice()[9]);
+    try std.testing.expectEqual(@as(f32, 11), result.slice()[10]);
+    try std.testing.expectEqual(@as(f32, 12), result.slice()[11]);
 }

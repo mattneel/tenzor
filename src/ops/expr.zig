@@ -850,6 +850,162 @@ pub fn GatherExpr(comptime Table: type, comptime Indices: type) type {
     };
 }
 
+/// Reshape expression type.
+/// Changes the shape of a tensor while keeping data layout.
+/// Total elements must match: prod(old_shape) == prod(new_shape)
+pub fn ReshapeExpr(comptime Input: type, comptime new_shape: anytype) type {
+    const input_numel = blk: {
+        var n: usize = 1;
+        for (ShapeOf(Input)) |d| n *= d;
+        break :blk n;
+    };
+
+    const new_ndim = new_shape.len;
+    const new_shape_arr: [new_ndim]usize = new_shape;
+
+    const new_numel = blk: {
+        var n: usize = 1;
+        for (new_shape_arr) |d| n *= d;
+        break :blk n;
+    };
+
+    comptime {
+        if (input_numel != new_numel) {
+            @compileError(std.fmt.comptimePrint(
+                "Reshape element count mismatch: {d} vs {d}",
+                .{ input_numel, new_numel },
+            ));
+        }
+    }
+
+    return struct {
+        pub const ExpressionMarker = true;
+        pub const kind: NodeKind = .reshape;
+        pub const InputType = Input;
+        pub const ElementType = ElementTypeOf(Input);
+        pub const ndim = new_ndim;
+        pub const shape = new_shape_arr;
+
+        input: Input,
+
+        const Self = @This();
+
+        pub fn init(input: Input) Self {
+            return .{ .input = input };
+        }
+
+        // Can chain operations after reshape
+        pub fn matmul(self: Self, other: anytype) MatmulExpr(Self, @TypeOf(other)) {
+            return MatmulExpr(Self, @TypeOf(other)).init(self, other);
+        }
+
+        pub fn add(self: Self, other: anytype) BinaryExpr(.add, Self, AsExpr(@TypeOf(other))) {
+            return BinaryExpr(.add, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
+        }
+
+        pub fn mul(self: Self, other: anytype) BinaryExpr(.mul, Self, AsExpr(@TypeOf(other))) {
+            return BinaryExpr(.mul, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
+        }
+
+        pub fn softmax(self: Self, comptime axis: isize) SoftmaxExpr(Self, axis) {
+            return SoftmaxExpr(Self, axis).init(self);
+        }
+
+        pub fn transpose(self: Self, comptime perm: anytype) TransposeExpr(Self, perm) {
+            return TransposeExpr(Self, perm).init(self);
+        }
+
+        pub fn reshape(self: Self, comptime target_shape: anytype) ReshapeExpr(Self, target_shape) {
+            return ReshapeExpr(Self, target_shape).init(self);
+        }
+    };
+}
+
+/// Transpose expression type.
+/// Permutes the axes of a tensor.
+/// perm specifies the new order of axes, e.g., .{0, 2, 1, 3} swaps axes 1 and 2.
+pub fn TransposeExpr(comptime Input: type, comptime perm: anytype) type {
+    const in_ndim = RankOf(Input);
+    const in_shape = ShapeOf(Input);
+
+    comptime {
+        if (perm.len != in_ndim) {
+            @compileError(std.fmt.comptimePrint(
+                "Transpose permutation length {d} must match input rank {d}",
+                .{ perm.len, in_ndim },
+            ));
+        }
+
+        // Verify it's a valid permutation
+        var seen: [in_ndim]bool = .{false} ** in_ndim;
+        for (perm) |p| {
+            if (p >= in_ndim) {
+                @compileError(std.fmt.comptimePrint(
+                    "Invalid permutation index {d} for rank {d}",
+                    .{ p, in_ndim },
+                ));
+            }
+            if (seen[p]) {
+                @compileError("Duplicate index in transpose permutation");
+            }
+            seen[p] = true;
+        }
+    }
+
+    const out_shape: [in_ndim]usize = blk: {
+        var s: [in_ndim]usize = undefined;
+        for (perm, 0..) |p, i| {
+            s[i] = in_shape[p];
+        }
+        break :blk s;
+    };
+
+    const perm_arr: [in_ndim]usize = perm;
+
+    return struct {
+        pub const ExpressionMarker = true;
+        pub const kind: NodeKind = .transpose;
+        pub const InputType = Input;
+        pub const ElementType = ElementTypeOf(Input);
+        pub const ndim = in_ndim;
+        pub const shape = out_shape;
+        pub const permutation = perm_arr;
+
+        input: Input,
+
+        const Self = @This();
+
+        pub fn init(input: Input) Self {
+            return .{ .input = input };
+        }
+
+        // Can chain operations after transpose
+        pub fn matmul(self: Self, other: anytype) MatmulExpr(Self, @TypeOf(other)) {
+            return MatmulExpr(Self, @TypeOf(other)).init(self, other);
+        }
+
+        pub fn add(self: Self, other: anytype) BinaryExpr(.add, Self, AsExpr(@TypeOf(other))) {
+            return BinaryExpr(.add, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
+        }
+
+        pub fn mul(self: Self, other: anytype) BinaryExpr(.mul, Self, AsExpr(@TypeOf(other))) {
+            return BinaryExpr(.mul, Self, AsExpr(@TypeOf(other))).init(self, asExpr(other));
+        }
+
+        pub fn softmax(self: Self, comptime axis: isize) SoftmaxExpr(Self, axis) {
+            return SoftmaxExpr(Self, axis).init(self);
+        }
+
+        pub fn transpose(self: Self, comptime new_perm: anytype) TransposeExpr(Self, new_perm) {
+            return TransposeExpr(Self, new_perm).init(self);
+        }
+
+        pub fn reshape(self: Self, comptime target_shape: anytype) ReshapeExpr(Self, target_shape) {
+            return ReshapeExpr(Self, target_shape).init(self);
+        }
+    };
+}
+
 /// Scalar constant expression (for broadcasting scalars).
 pub fn ScalarExpr(comptime T: type) type {
     return struct {
