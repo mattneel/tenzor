@@ -3,7 +3,16 @@
 Draw a digit below and watch Tenzor recognize it in real-time. This runs entirely in your browser using WebAssembly — no server, no network requests, just ~3KB of WASM and ~174KB of model weights.
 
 <div id="demo-container" style="text-align: center; margin: 2em 0;">
-  <canvas id="canvas" width="280" height="280" style="border: 2px solid #333; border-radius: 8px; cursor: crosshair; touch-action: none;"></canvas>
+  <div style="display: inline-flex; align-items: flex-start; gap: 1em;">
+    <div>
+      <canvas id="canvas" width="280" height="280" style="border: 2px solid #333; border-radius: 8px; cursor: crosshair; touch-action: none;"></canvas>
+      <div style="font-size: 0.8em; color: #666; margin-top: 0.3em;">Draw here</div>
+    </div>
+    <div>
+      <canvas id="preview" width="140" height="140" style="border: 2px solid #666; border-radius: 4px; image-rendering: pixelated;"></canvas>
+      <div style="font-size: 0.8em; color: #666; margin-top: 0.3em;">Model sees (28×28)</div>
+    </div>
+  </div>
   <div style="margin-top: 1em;">
     <button id="predict-btn" style="padding: 0.5em 1.5em; font-size: 1.1em; cursor: pointer; background: #4a4; color: white; border: none; border-radius: 4px; margin-right: 0.5em;">Predict</button>
     <button id="clear-btn" style="padding: 0.5em 1.5em; font-size: 1em; cursor: pointer;">Clear</button>
@@ -19,11 +28,17 @@ Draw a digit below and watch Tenzor recognize it in real-time. This runs entirel
 (async function() {
   const canvas = document.getElementById('canvas');
   const ctx = canvas.getContext('2d');
+  const preview = document.getElementById('preview');
+  const previewCtx = preview.getContext('2d');
   const result = document.getElementById('result');
   const confidence = document.getElementById('confidence');
   const status = document.getElementById('status');
   const clearBtn = document.getElementById('clear-btn');
   const predictBtn = document.getElementById('predict-btn');
+
+  // Initialize preview
+  previewCtx.fillStyle = 'black';
+  previewCtx.fillRect(0, 0, 140, 140);
 
   let wasm = null;
   let inputPtr = null;
@@ -128,6 +143,8 @@ Draw a digit below and watch Tenzor recognize it in real-time. This runs entirel
   clearBtn.addEventListener('click', () => {
     ctx.fillStyle = 'black';
     ctx.fillRect(0, 0, 280, 280);
+    previewCtx.fillStyle = 'black';
+    previewCtx.fillRect(0, 0, 140, 140);
     result.textContent = 'Draw a digit (0-9)';
     confidence.textContent = '';
   });
@@ -198,6 +215,21 @@ Draw a digit below and watch Tenzor recognize it in real-time. This runs entirel
         input[y * 28 + x] = count > 0 ? sum / (count * 255) : 0;
       }
     }
+
+    // Draw preview (scaled 5x from 28x28 to 140x140)
+    const previewData = previewCtx.createImageData(140, 140);
+    for (let y = 0; y < 140; y++) {
+      for (let x = 0; x < 140; x++) {
+        const srcIdx = Math.floor(y / 5) * 28 + Math.floor(x / 5);
+        const val = Math.floor(input[srcIdx] * 255);
+        const dstIdx = (y * 140 + x) * 4;
+        previewData.data[dstIdx] = val;
+        previewData.data[dstIdx + 1] = val;
+        previewData.data[dstIdx + 2] = val;
+        previewData.data[dstIdx + 3] = 255;
+      }
+    }
+    previewCtx.putImageData(previewData, 0, 0);
 
     // Copy to WASM memory
     const wasmInput = new Float32Array(wasm.memory.buffer, inputPtr, 28 * 28);
