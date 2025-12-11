@@ -40,6 +40,7 @@ pub const backend = struct {
 pub const io = struct {
     pub const safetensors = @import("io/safetensors.zig");
     pub const mnist = @import("io/mnist.zig");
+    pub const tokenizer = @import("io/tokenizer.zig");
 };
 
 // Model implementations
@@ -119,6 +120,7 @@ test {
     // I/O tests
     _ = io.safetensors;
     _ = io.mnist;
+    _ = io.tokenizer;
 
     // Model tests
     _ = model.arctic;
@@ -132,6 +134,7 @@ test {
     // Integration tests
     _ = @import("tests/arctic_integration_test.zig");
     _ = @import("tests/lenet_test.zig");
+    _ = @import("tests/tokenizer_parity_test.zig");
 
     // Fusion tests
     _ = fusion.analyzer;

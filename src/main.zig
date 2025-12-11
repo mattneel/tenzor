@@ -296,11 +296,27 @@ const EmbedArgs = struct {
 fn runEmbed(allocator: std.mem.Allocator, args: EmbedArgs) !void {
     const arctic = tenzor.model.arctic;
     const safetensors = tenzor.io.safetensors;
+    const Tokenizer = tenzor.io.tokenizer.Tokenizer;
 
     std.debug.print("Arctic-embed-xs Text Embedding\n", .{});
     std.debug.print("==============================\n", .{});
     std.debug.print("Model: {s}\n", .{args.model_path});
     std.debug.print("Texts: {d}\n\n", .{args.texts.len});
+
+    // Derive vocab path from model path (same directory)
+    var vocab_path_buf: [512]u8 = undefined;
+    const model_dir = std.fs.path.dirname(args.model_path) orelse ".";
+    const vocab_path = std.fmt.bufPrint(&vocab_path_buf, "{s}/vocab.txt", .{model_dir}) catch return error.PathTooLong;
+
+    // Load tokenizer
+    std.debug.print("Loading tokenizer...\n", .{});
+    var tokenizer = Tokenizer.init(allocator);
+    defer tokenizer.deinit();
+    tokenizer.loadVocab(vocab_path) catch |err| {
+        std.debug.print("Error loading vocab.txt: {}\n", .{err});
+        std.debug.print("Expected at: {s}\n", .{vocab_path});
+        return err;
+    };
 
     // Load model weights
     std.debug.print("Loading model...\n", .{});
@@ -316,7 +332,7 @@ fn runEmbed(allocator: std.mem.Allocator, args: EmbedArgs) !void {
     defer weights.deinit(allocator);
 
     // Create inference context
-    const max_seq_len: usize = 128;
+    const max_seq_len: usize = 512;
     var ctx = try arctic.InferenceContext.init(allocator, config, max_seq_len);
     defer ctx.deinit();
 
@@ -324,27 +340,19 @@ fn runEmbed(allocator: std.mem.Allocator, args: EmbedArgs) !void {
     std.debug.print("[\n", .{});
 
     for (args.texts, 0..) |text, i| {
-        // Simple tokenization: for demonstration, we use character codes
-        // In production, you'd use a proper WordPiece tokenizer
-        var token_ids: [128]u32 = undefined;
-        token_ids[0] = 101; // [CLS]
-
-        var seq_len: usize = 1;
-        for (text) |c| {
-            if (seq_len >= 127) break;
-            // Map ASCII to vocab IDs (simplified - real tokenizer needed)
-            token_ids[seq_len] = @as(u32, c) + 1000;
-            seq_len += 1;
-        }
-        token_ids[seq_len] = 102; // [SEP]
-        seq_len += 1;
+        // WordPiece tokenization
+        var token_ids: [512]u32 = undefined;
+        const seq_len = tokenizer.encode(text, &token_ids) catch |err| {
+            std.debug.print("Error tokenizing \"{s}\": {}\n", .{ text, err });
+            return err;
+        };
 
         // Generate embedding
         var embedding: [384]f32 = undefined;
         arctic.forward(&embedding, token_ids[0..seq_len], weights, &ctx);
 
         // Output as JSON
-        std.debug.print("  {{\n    \"text\": \"{s}\",\n    \"embedding\": [", .{text});
+        std.debug.print("  {{\n    \"text\": \"{s}\",\n    \"tokens\": {d},\n    \"embedding\": [", .{ text, seq_len });
         for (embedding, 0..) |v, j| {
             if (j > 0) std.debug.print(", ", .{});
             if (j % 10 == 0 and j > 0) std.debug.print("\n      ", .{});
