@@ -2,8 +2,11 @@
 //!
 //! Stores argmax indices during forward pass for efficient O(1) backward.
 //! Layout: NHWC (batch, height, width, channels)
+//!
+//! Parallel versions available for multi-threaded execution.
 
 const std = @import("std");
+const threading = @import("../threading.zig");
 
 /// Compute output dimension for pooling.
 pub fn poolOutputSize(
@@ -155,6 +158,191 @@ pub fn maxPool2dBackwardRecompute(
             }
         }
     }
+}
+
+// ============================================================================
+// Parallel versions
+// ============================================================================
+
+/// Parallel MaxPool2D forward pass.
+pub fn maxPool2dForwardParallel(
+    comptime T: type,
+    pool: *threading.ThreadPool,
+    input: []const T,
+    output: []T,
+    indices: []usize,
+    batch: usize,
+    in_h: usize,
+    in_w: usize,
+    channels: usize,
+    pool_h: usize,
+    pool_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+) void {
+    const out_h = poolOutputSize(in_h, pool_h, stride_h);
+    const out_w = poolOutputSize(in_w, pool_w, stride_w);
+    const in_batch_size = in_h * in_w * channels;
+    const out_batch_size = out_h * out_w * channels;
+
+    const Context = struct {
+        input: []const T,
+        output: []T,
+        indices: []usize,
+        in_h: usize,
+        in_w: usize,
+        channels: usize,
+        out_h: usize,
+        out_w: usize,
+        pool_h: usize,
+        pool_w: usize,
+        stride_h: usize,
+        stride_w: usize,
+        in_batch_size: usize,
+        out_batch_size: usize,
+    };
+
+    const ctx = Context{
+        .input = input,
+        .output = output,
+        .indices = indices,
+        .in_h = in_h,
+        .in_w = in_w,
+        .channels = channels,
+        .out_h = out_h,
+        .out_w = out_w,
+        .pool_h = pool_h,
+        .pool_w = pool_w,
+        .stride_h = stride_h,
+        .stride_w = stride_w,
+        .in_batch_size = in_batch_size,
+        .out_batch_size = out_batch_size,
+    };
+
+    pool.parallelForBatch(batch, ctx, struct {
+        fn work(c: Context, start: usize, end: usize) void {
+            for (start..end) |n| {
+                maxPool2dForwardSingle(
+                    T,
+                    c.input[n * c.in_batch_size ..][0..c.in_batch_size],
+                    c.output[n * c.out_batch_size ..][0..c.out_batch_size],
+                    c.indices[n * c.out_batch_size ..][0..c.out_batch_size],
+                    c.in_h,
+                    c.in_w,
+                    c.channels,
+                    c.out_h,
+                    c.out_w,
+                    c.pool_h,
+                    c.pool_w,
+                    c.stride_h,
+                    c.stride_w,
+                );
+            }
+        }
+    }.work);
+}
+
+/// Single-batch maxpool forward (helper for parallel version).
+fn maxPool2dForwardSingle(
+    comptime T: type,
+    input: []const T,
+    output: []T,
+    indices: []usize,
+    _: usize, // in_h (unused but kept for API consistency)
+    in_w: usize,
+    channels: usize,
+    out_h: usize,
+    out_w: usize,
+    pool_h: usize,
+    pool_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+) void {
+    for (0..out_h) |oh| {
+        for (0..out_w) |ow| {
+            const ih_start = oh * stride_h;
+            const iw_start = ow * stride_w;
+
+            for (0..channels) |c| {
+                var max_val: T = -std.math.inf(T);
+                var max_idx: usize = 0;
+
+                for (0..pool_h) |ph| {
+                    for (0..pool_w) |pw| {
+                        const ih = ih_start + ph;
+                        const iw = iw_start + pw;
+                        const in_idx = (ih * in_w + iw) * channels + c;
+                        const val = input[in_idx];
+
+                        if (val > max_val) {
+                            max_val = val;
+                            max_idx = in_idx;
+                        }
+                    }
+                }
+
+                const out_idx = (oh * out_w + ow) * channels + c;
+                output[out_idx] = max_val;
+                indices[out_idx] = max_idx;
+            }
+        }
+    }
+}
+
+/// Parallel MaxPool2D backward pass.
+pub fn maxPool2dBackwardParallel(
+    comptime T: type,
+    pool: *threading.ThreadPool,
+    grad_output: []const T,
+    indices: []const usize,
+    grad_input: []T,
+    batch: usize,
+    in_h: usize,
+    in_w: usize,
+    channels: usize,
+    pool_h: usize,
+    pool_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+) void {
+    const out_h = poolOutputSize(in_h, pool_h, stride_h);
+    const out_w = poolOutputSize(in_w, pool_w, stride_w);
+    const in_batch_size = in_h * in_w * channels;
+    const out_batch_size = out_h * out_w * channels;
+
+    // Initialize grad_input to zeros
+    @memset(grad_input, 0);
+
+    const Context = struct {
+        grad_output: []const T,
+        indices: []const usize,
+        grad_input: []T,
+        in_batch_size: usize,
+        out_batch_size: usize,
+    };
+
+    const ctx = Context{
+        .grad_output = grad_output,
+        .indices = indices,
+        .grad_input = grad_input,
+        .in_batch_size = in_batch_size,
+        .out_batch_size = out_batch_size,
+    };
+
+    pool.parallelForBatch(batch, ctx, struct {
+        fn work(c: Context, start: usize, end: usize) void {
+            for (start..end) |n| {
+                const out_offset = n * c.out_batch_size;
+                const in_offset = n * c.in_batch_size;
+
+                for (0..c.out_batch_size) |i| {
+                    const local_max_idx = c.indices[out_offset + i];
+                    // Convert to global index (add batch offset)
+                    c.grad_input[in_offset + local_max_idx] += c.grad_output[out_offset + i];
+                }
+            }
+        }
+    }.work);
 }
 
 // ============================================================================

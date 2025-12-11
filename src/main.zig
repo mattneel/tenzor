@@ -236,6 +236,7 @@ fn runTrain(allocator: std.mem.Allocator, args: TrainArgs) !void {
     const mnist = tenzor.io.mnist;
     const Trainer = tenzor.training.Trainer;
     const TrainerConfig = tenzor.training.TrainerConfig;
+    const threading = tenzor.backend.cpu.threading;
 
     // Build file paths
     var train_images_buf: [256]u8 = undefined;
@@ -317,9 +318,13 @@ fn runTrain(allocator: std.mem.Allocator, args: TrainArgs) !void {
     });
     defer trainer.deinit();
 
-    // Initialize model
+    // Initialize thread pool for parallel execution
+    var pool = try threading.ThreadPool.create(allocator, .{}); // Use all available cores
+    defer pool.destroy();
+
+    // Initialize model with thread pool for parallel kernels
     const model_config = lenet.LeNetConfig{ .batch_size = args.batch_size };
-    var model = try lenet.LeNet.init(allocator, model_config);
+    var model = try lenet.LeNet.init(allocator, model_config, pool);
     defer model.deinit();
 
     // Initialize weights
@@ -357,7 +362,7 @@ fn runTrain(allocator: std.mem.Allocator, args: TrainArgs) !void {
             // Backward pass
             model.grads.zero();
             model.computeLossGradient(batch.labels, actual_batch);
-            model.backward(batch.images, actual_batch);
+            try model.backward(batch.images, actual_batch);
 
             // SGD update with learning rate from scheduler
             const lr = trainer.getLR();
@@ -528,7 +533,12 @@ fn runEmbed(allocator: std.mem.Allocator, args: EmbedArgs) !void {
     const chunk_size: usize = 510; // Leave room for [CLS] and [SEP]
     const chunk_overlap: usize = 50;
 
-    std.debug.print("Generating embeddings...\n\n", .{});
+    // Create thread pool for parallel execution
+    const cpu_count: u32 = @intCast(std.Thread.getCpuCount() catch 4);
+    var pool = try ThreadPool.create(allocator, .{ .thread_count = cpu_count });
+    defer pool.destroy();
+
+    std.debug.print("Generating embeddings ({d} threads)...\n\n", .{cpu_count});
 
     // Process either file text or positional args
     if (file_text) |text| {
@@ -554,17 +564,16 @@ fn runEmbed(allocator: std.mem.Allocator, args: EmbedArgs) !void {
         const chunk_embeddings = try allocator.alloc([384]f32, num_chunks);
         defer allocator.free(chunk_embeddings);
 
-        // Parallel embedding - one context per worker thread
-        const cpu_count: u32 = @intCast(std.Thread.getCpuCount() catch 4);
-        const num_workers: usize = @min(cpu_count, num_chunks);
+        // Parallel embedding - limit workers to avoid cache thrashing
+        // Each InferenceContext uses ~5.5MB, so cap at 8 workers (~44MB working set)
+        const max_workers: usize = 8;
+        const num_workers: usize = @min(@min(cpu_count, num_chunks), max_workers);
 
         if (num_workers > 1) {
-            std.debug.print("Embedding with {d} threads...\n", .{num_workers});
-
-            var pool = try ThreadPool.create(allocator, .{ .thread_count = @intCast(num_workers) });
-            defer pool.destroy();
+            std.debug.print("Using {d} worker threads...\n", .{num_workers});
 
             // One context per worker - no sharing, no contention
+            // Don't pass pool to contexts - avoid nested parallelism overhead
             const contexts = try allocator.alloc(arctic.InferenceContext, num_workers);
             defer allocator.free(contexts);
             for (contexts) |*ctx| {
@@ -598,21 +607,23 @@ fn runEmbed(allocator: std.mem.Allocator, args: EmbedArgs) !void {
                 .sep_id = tokenizer.sep_id,
             };
 
-            // Spawn exactly num_workers work items - each gets exclusive context
-            pool.parallelFor(0, num_workers, 1, work_ctx, struct {
-                fn work(ctx: WorkCtx, worker_start: usize, worker_end: usize) void {
-                    _ = worker_end;
-                    const worker_id = worker_start;
+            // Create a smaller pool sized for our actual worker count
+            var chunk_pool = try ThreadPool.create(allocator, .{ .thread_count = @intCast(num_workers) });
+            defer chunk_pool.destroy();
 
-                    // Calculate this worker's chunk range
-                    const chunks_per_worker = (ctx.num_chunks + ctx.num_workers - 1) / ctx.num_workers;
-                    const my_start = worker_id * chunks_per_worker;
-                    const my_end = @min(my_start + chunks_per_worker, ctx.num_chunks);
+            // Compute chunks per worker for context assignment
+            const chunks_per_worker = (num_chunks + num_workers - 1) / num_workers;
 
-                    // This worker's dedicated context
-                    const inf_ctx = &ctx.contexts[worker_id];
+            // Parallelize over chunks using parallelForBatch (bypasses MIN_PARALLEL_SIZE threshold)
+            chunk_pool.parallelForBatch(num_chunks, work_ctx, struct {
+                fn work(ctx: WorkCtx, start: usize, end: usize) void {
+                    // Determine which context to use based on chunk range
+                    const chunks_per_ctx = (ctx.num_chunks + ctx.num_workers - 1) / ctx.num_workers;
+                    const worker_id = start / chunks_per_ctx;
+                    const ctx_idx = worker_id % ctx.num_workers;
+                    const inf_ctx = &ctx.contexts[ctx_idx];
 
-                    for (my_start..my_end) |chunk_idx| {
+                    for (start..end) |chunk_idx| {
                         const stride = ctx.chunk_size - ctx.chunk_overlap;
                         const token_start = chunk_idx * stride;
                         const token_end = @min(token_start + ctx.chunk_size, ctx.all_tokens.len);
@@ -627,9 +638,10 @@ fn runEmbed(allocator: std.mem.Allocator, args: EmbedArgs) !void {
                     }
                 }
             }.work);
+            _ = chunks_per_worker;
         } else {
-            // Single chunk - no parallelism needed
-            var ctx = try arctic.InferenceContext.init(allocator, config, max_seq_len);
+            // Single chunk - still use parallel internal ops
+            var ctx = try arctic.InferenceContext.initWithPool(allocator, config, max_seq_len, pool);
             defer ctx.deinit();
 
             var chunk_tokens: [512]u32 = undefined;
@@ -669,32 +681,91 @@ fn runEmbed(allocator: std.mem.Allocator, args: EmbedArgs) !void {
         }
         std.debug.print("]\n", .{});
     } else {
-        // Multiple texts from args - process sequentially (each text is typically short)
-        var ctx = try arctic.InferenceContext.init(allocator, config, max_seq_len);
-        defer ctx.deinit();
+        // Multiple texts from args - use parallel batch processing
+        const num_texts = args.texts.len;
 
-        std.debug.print("[\n", .{});
-        for (args.texts, 0..) |text, i| {
-            var token_ids: [512]u32 = undefined;
-            const seq_len = tokenizer.encode(text, &token_ids) catch |err| {
-                std.debug.print("Error tokenizing \"{s}\": {}\n", .{ text, err });
-                return err;
-            };
+        if (num_texts > 1 and cpu_count > 1) {
+            // Tokenize all texts first
+            const token_ids_storage = try allocator.alloc([512]u32, num_texts);
+            defer allocator.free(token_ids_storage);
 
-            var embedding: [384]f32 = undefined;
-            arctic.forward(&embedding, token_ids[0..seq_len], weights, &ctx);
+            const seq_lens = try allocator.alloc(usize, num_texts);
+            defer allocator.free(seq_lens);
 
-            std.debug.print("  {{\n    \"text\": \"{s}\",\n    \"tokens\": {d},\n    \"embedding\": [", .{ text, seq_len });
-            for (embedding, 0..) |v, j| {
-                if (j > 0) std.debug.print(", ", .{});
-                if (j % 10 == 0 and j > 0) std.debug.print("\n      ", .{});
-                std.debug.print("{d:.6}", .{v});
+            for (args.texts, 0..) |text, i| {
+                seq_lens[i] = tokenizer.encode(text, &token_ids_storage[i]) catch |err| {
+                    std.debug.print("Error tokenizing \"{s}\": {}\n", .{ text, err });
+                    return err;
+                };
             }
-            std.debug.print("]\n  }}", .{});
-            if (i < args.texts.len - 1) std.debug.print(",", .{});
-            std.debug.print("\n", .{});
+
+            // Create batch context pool for parallel processing
+            const num_contexts = @min(cpu_count, num_texts);
+            var ctx_pool = try arctic.BatchContextPool.init(allocator, config, max_seq_len, num_contexts, pool);
+            defer ctx_pool.deinit();
+
+            // Allocate output embeddings
+            const embeddings = try allocator.alloc([384]f32, num_texts);
+            defer allocator.free(embeddings);
+
+            // Build slice array for forwardBatchParallel
+            const token_slices = try allocator.alloc([]const u32, num_texts);
+            defer allocator.free(token_slices);
+            for (0..num_texts) |i| {
+                token_slices[i] = token_ids_storage[i][0..seq_lens[i]];
+            }
+
+            // Process all texts in parallel
+            arctic.forwardBatchParallel(
+                @as([*]f32, @ptrCast(embeddings.ptr))[0 .. num_texts * 384],
+                token_slices,
+                weights,
+                &ctx_pool,
+                pool,
+            );
+
+            // Output results
+            std.debug.print("[\n", .{});
+            for (args.texts, 0..) |text, i| {
+                std.debug.print("  {{\n    \"text\": \"{s}\",\n    \"tokens\": {d},\n    \"embedding\": [", .{ text, seq_lens[i] });
+                for (embeddings[i], 0..) |v, j| {
+                    if (j > 0) std.debug.print(", ", .{});
+                    if (j % 10 == 0 and j > 0) std.debug.print("\n      ", .{});
+                    std.debug.print("{d:.6}", .{v});
+                }
+                std.debug.print("]\n  }}", .{});
+                if (i < args.texts.len - 1) std.debug.print(",", .{});
+                std.debug.print("\n", .{});
+            }
+            std.debug.print("]\n", .{});
+        } else {
+            // Single text or single thread - use simple path with parallel internal ops
+            var ctx = try arctic.InferenceContext.initWithPool(allocator, config, max_seq_len, pool);
+            defer ctx.deinit();
+
+            std.debug.print("[\n", .{});
+            for (args.texts, 0..) |text, i| {
+                var token_ids: [512]u32 = undefined;
+                const seq_len = tokenizer.encode(text, &token_ids) catch |err| {
+                    std.debug.print("Error tokenizing \"{s}\": {}\n", .{ text, err });
+                    return err;
+                };
+
+                var embedding: [384]f32 = undefined;
+                arctic.forward(&embedding, token_ids[0..seq_len], weights, &ctx);
+
+                std.debug.print("  {{\n    \"text\": \"{s}\",\n    \"tokens\": {d},\n    \"embedding\": [", .{ text, seq_len });
+                for (embedding, 0..) |v, j| {
+                    if (j > 0) std.debug.print(", ", .{});
+                    if (j % 10 == 0 and j > 0) std.debug.print("\n      ", .{});
+                    std.debug.print("{d:.6}", .{v});
+                }
+                std.debug.print("]\n  }}", .{});
+                if (i < args.texts.len - 1) std.debug.print(",", .{});
+                std.debug.print("\n", .{});
+            }
+            std.debug.print("]\n", .{});
         }
-        std.debug.print("]\n", .{});
     }
 }
 

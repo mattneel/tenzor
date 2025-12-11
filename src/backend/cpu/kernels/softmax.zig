@@ -4,9 +4,12 @@
 //! softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))
 //!
 //! Designed for attention patterns: [B, H, S, S] with axis=-1.
+//!
+//! Parallel versions available for multi-threaded execution.
 
 const std = @import("std");
 const simd = @import("../simd.zig");
+const threading = @import("../threading.zig");
 
 /// Softmax along the last axis.
 /// Input/output shape: [..., axis_size]
@@ -208,6 +211,143 @@ pub fn softmaxAxis(
             }
         }
     }
+}
+
+// ============================================================================
+// Parallel Versions
+// ============================================================================
+
+/// Parallel softmax along the last axis.
+/// Distributes rows across threads for multi-core execution.
+pub fn softmaxLastAxisParallel(
+    comptime T: type,
+    input: []const T,
+    output: []T,
+    comptime ndim: usize,
+    shape: [ndim]usize,
+    mask: ?[]const T,
+    pool: *threading.ThreadPool,
+) void {
+    const axis_size = shape[ndim - 1];
+    const num_rows = blk: {
+        var n: usize = 1;
+        for (0..ndim - 1) |i| {
+            n *= shape[i];
+        }
+        break :blk n;
+    };
+
+    const Context = struct {
+        input: []const T,
+        output: []T,
+        axis_size: usize,
+        mask: ?[]const T,
+    };
+
+    const ctx = Context{
+        .input = input,
+        .output = output,
+        .axis_size = axis_size,
+        .mask = mask,
+    };
+
+    pool.parallelForBatch(num_rows, ctx, struct {
+        fn work(c: Context, start: usize, end: usize) void {
+            for (start..end) |row| {
+                const row_start = row * c.axis_size;
+                const row_end = row_start + c.axis_size;
+                const row_input = c.input[row_start..row_end];
+                const row_output = c.output[row_start..row_end];
+                const row_mask = if (c.mask) |m| m[row_start..row_end] else null;
+                softmaxRow(T, row_input, row_output, row_mask);
+            }
+        }
+    }.work);
+}
+
+/// Parallel softmax along an arbitrary axis.
+pub fn softmaxAxisParallel(
+    comptime T: type,
+    input: []const T,
+    output: []T,
+    comptime ndim: usize,
+    shape: [ndim]usize,
+    comptime axis: usize,
+    mask: ?[]const T,
+    pool: *threading.ThreadPool,
+) void {
+    // For last axis, use optimized parallel path
+    if (axis == ndim - 1) {
+        softmaxLastAxisParallel(T, input, output, ndim, shape, mask, pool);
+        return;
+    }
+
+    // General case: compute outer_size, axis_size, inner_size
+    var outer_size: usize = 1;
+    for (0..axis) |i| {
+        outer_size *= shape[i];
+    }
+
+    const axis_size = shape[axis];
+
+    var inner_size: usize = 1;
+    for ((axis + 1)..ndim) |i| {
+        inner_size *= shape[i];
+    }
+
+    const num_positions = outer_size * inner_size;
+
+    const Context = struct {
+        input: []const T,
+        output: []T,
+        mask: ?[]const T,
+        axis_size: usize,
+        inner_size: usize,
+        outer_size: usize,
+    };
+
+    const ctx = Context{
+        .input = input,
+        .output = output,
+        .mask = mask,
+        .axis_size = axis_size,
+        .inner_size = inner_size,
+        .outer_size = outer_size,
+    };
+
+    pool.parallelForBatch(num_positions, ctx, struct {
+        fn work(c: Context, start: usize, end: usize) void {
+            for (start..end) |pos| {
+                const outer = pos / c.inner_size;
+                const inner = pos % c.inner_size;
+
+                // Step 1: Find max
+                var max_val: T = -std.math.inf(T);
+                for (0..c.axis_size) |a| {
+                    const idx = outer * c.axis_size * c.inner_size + a * c.inner_size + inner;
+                    const val = if (c.mask) |m| c.input[idx] + m[idx] else c.input[idx];
+                    max_val = @max(max_val, val);
+                }
+
+                // Step 2 & 3: Compute exp and sum
+                var sum_val: T = 0;
+                for (0..c.axis_size) |a| {
+                    const idx = outer * c.axis_size * c.inner_size + a * c.inner_size + inner;
+                    const val = if (c.mask) |m| c.input[idx] + m[idx] else c.input[idx];
+                    const exp_v = @exp(val - max_val);
+                    c.output[idx] = exp_v;
+                    sum_val += exp_v;
+                }
+
+                // Step 4: Normalize
+                const inv_sum = 1.0 / sum_val;
+                for (0..c.axis_size) |a| {
+                    const idx = outer * c.axis_size * c.inner_size + a * c.inner_size + inner;
+                    c.output[idx] *= inv_sum;
+                }
+            }
+        }
+    }.work);
 }
 
 // ============================================================================

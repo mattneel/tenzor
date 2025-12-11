@@ -2,9 +2,12 @@
 //!
 //! Implements efficient matrix multiplication with cache-aware tiling
 //! and SIMD vectorization where possible.
+//!
+//! Parallel versions available for multi-threaded execution.
 
 const std = @import("std");
 const simd = @import("../simd.zig");
+const threading = @import("../threading.zig");
 
 /// Tile sizes for cache optimization.
 /// These are chosen to fit in L1 cache (~32KB) while maintaining efficiency.
@@ -414,6 +417,437 @@ pub fn batchedMatmulGeneral(
             k,
             n,
         );
+    }
+}
+
+// ============================================================================
+// Parallel versions (using ThreadPool)
+// ============================================================================
+
+/// Parallel tiled matrix multiplication: C = A @ B
+/// Parallelizes over rows of the output matrix.
+pub fn matmulTiledParallel(
+    comptime T: type,
+    pool: *threading.ThreadPool,
+    a: []const T,
+    b: []const T,
+    c: []T,
+    m: usize,
+    k: usize,
+    n: usize,
+) void {
+    // For small matrices, fall back to sequential
+    if (m * n < threading.MIN_PARALLEL_SIZE or m < pool.getThreadCount() * 2) {
+        matmulTiled(T, a, b, c, m, k, n);
+        return;
+    }
+
+    // Initialize C to zero
+    @memset(c, 0);
+
+    const Context = struct {
+        a: []const T,
+        b: []const T,
+        c: []T,
+        m: usize,
+        k: usize,
+        n: usize,
+    };
+
+    const ctx = Context{
+        .a = a,
+        .b = b,
+        .c = c,
+        .m = m,
+        .k = k,
+        .n = n,
+    };
+
+    // Parallelize over row tiles
+    const num_row_tiles = (m + TILE_M - 1) / TILE_M;
+    pool.parallelForBatch(num_row_tiles, ctx, struct {
+        fn work(c_ctx: Context, tile_start: usize, tile_end: usize) void {
+            for (tile_start..tile_end) |tile_idx| {
+                const ii = tile_idx * TILE_M;
+                const m_end = @min(ii + TILE_M, c_ctx.m);
+
+                // For this row tile, iterate over all column and K tiles
+                var jj: usize = 0;
+                while (jj < c_ctx.n) : (jj += TILE_N) {
+                    const n_end = @min(jj + TILE_N, c_ctx.n);
+
+                    var kk: usize = 0;
+                    while (kk < c_ctx.k) : (kk += TILE_K) {
+                        const k_end = @min(kk + TILE_K, c_ctx.k);
+
+                        matmulTileInternal(
+                            T,
+                            c_ctx.a,
+                            c_ctx.b,
+                            c_ctx.c,
+                            c_ctx.k,
+                            c_ctx.n,
+                            ii,
+                            m_end,
+                            jj,
+                            n_end,
+                            kk,
+                            k_end,
+                        );
+                    }
+                }
+            }
+        }
+    }.work);
+}
+
+/// Internal tile computation for parallel matmul.
+fn matmulTileInternal(
+    comptime T: type,
+    a: []const T,
+    b: []const T,
+    c: []T,
+    k: usize,
+    n: usize,
+    i_start: usize,
+    i_end: usize,
+    j_start: usize,
+    j_end: usize,
+    k_start: usize,
+    k_end: usize,
+) void {
+    for (i_start..i_end) |i| {
+        for (k_start..k_end) |kk| {
+            const a_ik = a[i * k + kk];
+
+            var j = j_start;
+            const vec_len = simd.suggestVectorLength(T);
+
+            // SIMD path
+            while (j + vec_len <= j_end) : (j += vec_len) {
+                const b_vec = simd.load(T, b[kk * n + j ..]);
+                var c_vec = simd.load(T, c[i * n + j ..]);
+                const a_vec = simd.splat(T, a_ik);
+                c_vec = simd.add(T, c_vec, simd.mul(T, a_vec, b_vec));
+                simd.store(T, c_vec, c[i * n + j ..]);
+            }
+
+            // Scalar remainder
+            while (j < j_end) : (j += 1) {
+                c[i * n + j] += a_ik * b[kk * n + j];
+            }
+        }
+    }
+}
+
+/// Parallel batched matrix multiplication: C[b] = A[b] @ B[b]
+/// Parallelizes over the batch dimension.
+pub fn batchedMatmulParallel(
+    comptime T: type,
+    pool: *threading.ThreadPool,
+    a: []const T,
+    b: []const T,
+    c: []T,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) void {
+    const a_batch_stride = m * k;
+    const b_batch_stride = k * n;
+    const c_batch_stride = m * n;
+
+    const Context = struct {
+        a: []const T,
+        b: []const T,
+        c: []T,
+        a_batch_stride: usize,
+        b_batch_stride: usize,
+        c_batch_stride: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    };
+
+    const ctx = Context{
+        .a = a,
+        .b = b,
+        .c = c,
+        .a_batch_stride = a_batch_stride,
+        .b_batch_stride = b_batch_stride,
+        .c_batch_stride = c_batch_stride,
+        .m = m,
+        .k = k,
+        .n = n,
+    };
+
+    pool.parallelForBatch(batch, ctx, struct {
+        fn work(c_ctx: Context, start: usize, end: usize) void {
+            for (start..end) |batch_idx| {
+                const a_offset = batch_idx * c_ctx.a_batch_stride;
+                const b_offset = batch_idx * c_ctx.b_batch_stride;
+                const c_offset = batch_idx * c_ctx.c_batch_stride;
+
+                matmulTiled(
+                    T,
+                    c_ctx.a[a_offset..][0..c_ctx.a_batch_stride],
+                    c_ctx.b[b_offset..][0..c_ctx.b_batch_stride],
+                    c_ctx.c[c_offset..][0..c_ctx.c_batch_stride],
+                    c_ctx.m,
+                    c_ctx.k,
+                    c_ctx.n,
+                );
+            }
+        }
+    }.work);
+}
+
+/// Parallel linear layer forward: Y = X @ W^T + b
+/// Parallelizes over the batch dimension.
+pub fn linearForwardParallel(
+    comptime T: type,
+    pool: *threading.ThreadPool,
+    input: []const T,
+    weight: []const T,
+    bias: []const T,
+    output: []T,
+    batch_size: usize,
+    in_features: usize,
+    out_features: usize,
+) void {
+    const Context = struct {
+        input: []const T,
+        weight: []const T,
+        bias: []const T,
+        output: []T,
+        in_features: usize,
+        out_features: usize,
+    };
+
+    const ctx = Context{
+        .input = input,
+        .weight = weight,
+        .bias = bias,
+        .output = output,
+        .in_features = in_features,
+        .out_features = out_features,
+    };
+
+    pool.parallelForBatch(batch_size, ctx, struct {
+        fn work(c: Context, start: usize, end: usize) void {
+            for (start..end) |b| {
+                const in_row = c.input[b * c.in_features ..][0..c.in_features];
+                const out_row = c.output[b * c.out_features ..][0..c.out_features];
+
+                for (0..c.out_features) |j| {
+                    var sum: T = c.bias[j];
+                    const w_row = c.weight[j * c.in_features ..][0..c.in_features];
+
+                    // SIMD dot product
+                    var i: usize = 0;
+                    const vec_len = simd.suggestVectorLength(T);
+                    var vec_sum = simd.splat(T, 0);
+
+                    while (i + vec_len <= c.in_features) : (i += vec_len) {
+                        const in_vec = simd.load(T, in_row[i..]);
+                        const w_vec = simd.load(T, w_row[i..]);
+                        vec_sum = simd.add(T, vec_sum, simd.mul(T, in_vec, w_vec));
+                    }
+                    sum += simd.reduceAdd(T, vec_sum);
+
+                    // Scalar remainder
+                    while (i < c.in_features) : (i += 1) {
+                        sum += in_row[i] * w_row[i];
+                    }
+
+                    out_row[j] = sum;
+                }
+            }
+        }
+    }.work);
+}
+
+/// Parallel linear layer backward.
+/// Computes grad_input, grad_weight (with thread-local accumulation), and grad_bias.
+pub fn linearBackwardParallel(
+    comptime T: type,
+    pool: *threading.ThreadPool,
+    allocator: std.mem.Allocator,
+    input: []const T,
+    grad_output: []const T,
+    weight: []const T,
+    grad_input: []T,
+    grad_weight: []T,
+    grad_bias: []T,
+    batch_size: usize,
+    in_features: usize,
+    out_features: usize,
+) !void {
+    // For small batches, use sequential
+    if (batch_size < pool.getThreadCount() * 2) {
+        linearBackwardSequential(
+            T,
+            input,
+            grad_output,
+            weight,
+            grad_input,
+            grad_weight,
+            grad_bias,
+            batch_size,
+            in_features,
+            out_features,
+        );
+        return;
+    }
+
+    // Parallel grad_input computation (embarrassingly parallel over batch)
+    const GradInputCtx = struct {
+        grad_output: []const T,
+        weight: []const T,
+        grad_input: []T,
+        in_features: usize,
+        out_features: usize,
+    };
+
+    pool.parallelForBatch(batch_size, GradInputCtx{
+        .grad_output = grad_output,
+        .weight = weight,
+        .grad_input = grad_input,
+        .in_features = in_features,
+        .out_features = out_features,
+    }, struct {
+        fn work(c: GradInputCtx, start: usize, end: usize) void {
+            for (start..end) |b| {
+                const grad_out_row = c.grad_output[b * c.out_features ..][0..c.out_features];
+                const grad_in_row = c.grad_input[b * c.in_features ..][0..c.in_features];
+
+                for (0..c.in_features) |i| {
+                    var sum: T = 0;
+                    for (0..c.out_features) |j| {
+                        sum += grad_out_row[j] * c.weight[j * c.in_features + i];
+                    }
+                    grad_in_row[i] = sum;
+                }
+            }
+        }
+    }.work);
+
+    // Weight gradient with thread-local accumulation
+    const num_threads = pool.getThreadCount();
+    const thread_grad_weights = try allocator.alloc([]T, num_threads);
+    defer allocator.free(thread_grad_weights);
+
+    const thread_grad_biases = try allocator.alloc([]T, num_threads);
+    defer allocator.free(thread_grad_biases);
+
+    for (0..num_threads) |t| {
+        thread_grad_weights[t] = try allocator.alloc(T, in_features * out_features);
+        @memset(thread_grad_weights[t], 0);
+        thread_grad_biases[t] = try allocator.alloc(T, out_features);
+        @memset(thread_grad_biases[t], 0);
+    }
+    defer for (0..num_threads) |t| {
+        allocator.free(thread_grad_weights[t]);
+        allocator.free(thread_grad_biases[t]);
+    };
+
+    const GradWeightCtx = struct {
+        input: []const T,
+        grad_output: []const T,
+        thread_grad_weights: [][]T,
+        thread_grad_biases: [][]T,
+        in_features: usize,
+        out_features: usize,
+        num_threads: usize,
+        batch_size: usize,
+    };
+
+    pool.parallelForBatch(num_threads, GradWeightCtx{
+        .input = input,
+        .grad_output = grad_output,
+        .thread_grad_weights = thread_grad_weights,
+        .thread_grad_biases = thread_grad_biases,
+        .in_features = in_features,
+        .out_features = out_features,
+        .num_threads = num_threads,
+        .batch_size = batch_size,
+    }, struct {
+        fn work(c: GradWeightCtx, start: usize, end: usize) void {
+            _ = end;
+            const thread_id = start;
+            const batches_per_thread = (c.batch_size + c.num_threads - 1) / c.num_threads;
+            const batch_start = thread_id * batches_per_thread;
+            const batch_end = @min(batch_start + batches_per_thread, c.batch_size);
+
+            const my_grad_weight = c.thread_grad_weights[thread_id];
+            const my_grad_bias = c.thread_grad_biases[thread_id];
+
+            for (batch_start..batch_end) |b| {
+                const in_row = c.input[b * c.in_features ..][0..c.in_features];
+                const grad_out_row = c.grad_output[b * c.out_features ..][0..c.out_features];
+
+                for (0..c.out_features) |j| {
+                    my_grad_bias[j] += grad_out_row[j];
+                    for (0..c.in_features) |i| {
+                        my_grad_weight[j * c.in_features + i] += in_row[i] * grad_out_row[j];
+                    }
+                }
+            }
+        }
+    }.work);
+
+    // Reduce thread-local gradients
+    @memset(grad_weight, 0);
+    @memset(grad_bias, 0);
+
+    for (0..num_threads) |t| {
+        for (grad_weight, thread_grad_weights[t]) |*gw, tgw| {
+            gw.* += tgw;
+        }
+        for (grad_bias, thread_grad_biases[t]) |*gb, tgb| {
+            gb.* += tgb;
+        }
+    }
+}
+
+/// Sequential linear backward (helper).
+fn linearBackwardSequential(
+    comptime T: type,
+    input: []const T,
+    grad_output: []const T,
+    weight: []const T,
+    grad_input: []T,
+    grad_weight: []T,
+    grad_bias: []T,
+    batch_size: usize,
+    in_features: usize,
+    out_features: usize,
+) void {
+    // grad_input = grad_output @ weight
+    for (0..batch_size) |b| {
+        const grad_out_row = grad_output[b * out_features ..][0..out_features];
+        const grad_in_row = grad_input[b * in_features ..][0..in_features];
+
+        for (0..in_features) |i| {
+            var sum: T = 0;
+            for (0..out_features) |j| {
+                sum += grad_out_row[j] * weight[j * in_features + i];
+            }
+            grad_in_row[i] = sum;
+        }
+    }
+
+    // grad_weight, grad_bias accumulation
+    for (0..batch_size) |b| {
+        const in_row = input[b * in_features ..][0..in_features];
+        const grad_out_row = grad_output[b * out_features ..][0..out_features];
+
+        for (0..out_features) |j| {
+            grad_bias[j] += grad_out_row[j];
+            for (0..in_features) |i| {
+                grad_weight[j * in_features + i] += in_row[i] * grad_out_row[j];
+            }
+        }
     }
 }
 

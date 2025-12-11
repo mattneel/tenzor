@@ -19,6 +19,7 @@ const maxpool = @import("../backend/cpu/kernels/maxpool.zig");
 const matmul = @import("../backend/cpu/kernels/matmul.zig");
 const loss_mod = @import("../nn/loss.zig");
 const init_mod = @import("../nn/init.zig");
+const threading = @import("../backend/cpu/threading.zig");
 
 pub const LeNetConfig = struct {
     batch_size: usize = 64,
@@ -236,14 +237,16 @@ pub const LeNet = struct {
     weights: LeNetWeights,
     grads: LeNetGrads,
     cache: LeNetCache,
+    pool: ?*threading.ThreadPool,
 
-    pub fn init(allocator: std.mem.Allocator, config: LeNetConfig) !LeNet {
+    pub fn init(allocator: std.mem.Allocator, config: LeNetConfig, pool: ?*threading.ThreadPool) !LeNet {
         return .{
             .allocator = allocator,
             .config = config,
             .weights = try LeNetWeights.init(allocator),
             .grads = try LeNetGrads.init(allocator),
             .cache = try LeNetCache.init(allocator, config.batch_size),
+            .pool = pool,
         };
     }
 
@@ -257,6 +260,14 @@ pub const LeNet = struct {
     /// Input: [batch_size, 28, 28, 1]
     /// Returns: logits [batch_size, 10]
     pub fn forward(self: *LeNet, input: []const f32, batch_size: usize) []const f32 {
+        if (self.pool) |pool| {
+            return self.forwardParallel(pool, input, batch_size);
+        } else {
+            return self.forwardSequential(input, batch_size);
+        }
+    }
+
+    fn forwardSequential(self: *LeNet, input: []const f32, batch_size: usize) []const f32 {
         // Conv1: [N, 28, 28, 1] -> [N, 24, 24, 6]
         conv2d.conv2dForward(
             f32,
@@ -377,16 +388,146 @@ pub const LeNet = struct {
         return self.cache.fc3_out;
     }
 
+    fn forwardParallel(self: *LeNet, pool: *threading.ThreadPool, input: []const f32, batch_size: usize) []const f32 {
+        // Conv1: [N, 28, 28, 1] -> [N, 24, 24, 6]
+        conv2d.conv2dForwardParallel(
+            f32,
+            pool,
+            input,
+            self.weights.conv1_weight,
+            self.weights.conv1_bias,
+            self.cache.conv1_out,
+            batch_size,
+            28,
+            28,
+            1,
+            6,
+            5,
+            5,
+            1,
+            1,
+            0,
+            0,
+        );
+        applyRelu(self.cache.conv1_out);
+
+        // MaxPool1: [N, 24, 24, 6] -> [N, 12, 12, 6]
+        maxpool.maxPool2dForward(
+            f32,
+            self.cache.conv1_out,
+            self.cache.pool1_out,
+            self.cache.pool1_indices,
+            batch_size,
+            24,
+            24,
+            6,
+            2,
+            2,
+            2,
+            2,
+        );
+
+        // Conv2: [N, 12, 12, 6] -> [N, 8, 8, 16]
+        conv2d.conv2dForwardParallel(
+            f32,
+            pool,
+            self.cache.pool1_out,
+            self.weights.conv2_weight,
+            self.weights.conv2_bias,
+            self.cache.conv2_out,
+            batch_size,
+            12,
+            12,
+            6,
+            16,
+            5,
+            5,
+            1,
+            1,
+            0,
+            0,
+        );
+        applyRelu(self.cache.conv2_out);
+
+        // MaxPool2: [N, 8, 8, 16] -> [N, 4, 4, 16]
+        maxpool.maxPool2dForward(
+            f32,
+            self.cache.conv2_out,
+            self.cache.pool2_out,
+            self.cache.pool2_indices,
+            batch_size,
+            8,
+            8,
+            16,
+            2,
+            2,
+            2,
+            2,
+        );
+
+        // FC1: [N, 256] @ [256, 120]^T -> [N, 120]
+        matmul.linearForwardParallel(
+            f32,
+            pool,
+            self.cache.pool2_out,
+            self.weights.fc1_weight,
+            self.weights.fc1_bias,
+            self.cache.fc1_pre,
+            batch_size,
+            256,
+            120,
+        );
+        for (self.cache.fc1_pre, self.cache.fc1_out) |pre, *out| {
+            out.* = @max(pre, 0);
+        }
+
+        // FC2: [N, 120] @ [120, 84]^T -> [N, 84]
+        matmul.linearForwardParallel(
+            f32,
+            pool,
+            self.cache.fc1_out,
+            self.weights.fc2_weight,
+            self.weights.fc2_bias,
+            self.cache.fc2_pre,
+            batch_size,
+            120,
+            84,
+        );
+        for (self.cache.fc2_pre, self.cache.fc2_out) |pre, *out| {
+            out.* = @max(pre, 0);
+        }
+
+        // FC3: [N, 84] @ [84, 10]^T -> [N, 10]
+        matmul.linearForwardParallel(
+            f32,
+            pool,
+            self.cache.fc2_out,
+            self.weights.fc3_weight,
+            self.weights.fc3_bias,
+            self.cache.fc3_out,
+            batch_size,
+            84,
+            10,
+        );
+
+        return self.cache.fc3_out;
+    }
+
     /// Backward pass: compute gradients.
     /// Must be called after forward() and computeLossGradient().
     /// Uses self.cache.grad_fc3 which should be filled by computeLossGradient().
-    pub fn backward(self: *LeNet, input: []const f32, batch_size: usize) void {
+    pub fn backward(self: *LeNet, input: []const f32, batch_size: usize) !void {
+        if (self.pool) |pool| {
+            try self.backwardParallel(pool, input, batch_size);
+        } else {
+            self.backwardSequential(input, batch_size);
+        }
+    }
+
+    fn backwardSequential(self: *LeNet, input: []const f32, batch_size: usize) void {
         // grad_fc3 is already filled by computeLossGradient()
 
         // === FC3 backward ===
-        // grad_fc2_out = grad_fc3 @ fc3_weight
-        // grad_fc3_weight += fc2_out^T @ grad_fc3
-        // grad_fc3_bias += sum(grad_fc3, axis=0)
         linearBackward(
             self.cache.fc2_out,
             self.cache.grad_fc3,
@@ -419,7 +560,6 @@ pub const LeNet = struct {
         applyReluBackward(self.cache.grad_fc1, self.cache.fc1_pre);
 
         // === FC1 backward ===
-        // grad_pool2 = grad_fc1 @ fc1_weight
         linearBackward(
             self.cache.pool2_out,
             self.cache.grad_fc1,
@@ -510,6 +650,158 @@ pub const LeNet = struct {
         // === Conv1 backward (only weight, not input) ===
         conv2d.conv2dBackwardWeight(
             f32,
+            input,
+            self.cache.grad_conv1,
+            self.grads.conv1_weight,
+            self.grads.conv1_bias,
+            batch_size,
+            28,
+            28,
+            1,
+            6,
+            5,
+            5,
+            1,
+            1,
+            0,
+            0,
+        );
+    }
+
+    fn backwardParallel(self: *LeNet, pool: *threading.ThreadPool, input: []const f32, batch_size: usize) !void {
+        // === FC3 backward ===
+        try matmul.linearBackwardParallel(
+            f32,
+            pool,
+            self.allocator,
+            self.cache.fc2_out,
+            self.cache.grad_fc3,
+            self.weights.fc3_weight,
+            self.cache.grad_fc2,
+            self.grads.fc3_weight,
+            self.grads.fc3_bias,
+            batch_size,
+            84,
+            10,
+        );
+
+        applyReluBackward(self.cache.grad_fc2, self.cache.fc2_pre);
+
+        // === FC2 backward ===
+        try matmul.linearBackwardParallel(
+            f32,
+            pool,
+            self.allocator,
+            self.cache.fc1_out,
+            self.cache.grad_fc2,
+            self.weights.fc2_weight,
+            self.cache.grad_fc1,
+            self.grads.fc2_weight,
+            self.grads.fc2_bias,
+            batch_size,
+            120,
+            84,
+        );
+
+        applyReluBackward(self.cache.grad_fc1, self.cache.fc1_pre);
+
+        // === FC1 backward ===
+        try matmul.linearBackwardParallel(
+            f32,
+            pool,
+            self.allocator,
+            self.cache.pool2_out,
+            self.cache.grad_fc1,
+            self.weights.fc1_weight,
+            self.cache.grad_pool2,
+            self.grads.fc1_weight,
+            self.grads.fc1_bias,
+            batch_size,
+            256,
+            120,
+        );
+
+        // === MaxPool2 backward ===
+        maxpool.maxPool2dBackward(
+            f32,
+            self.cache.grad_pool2,
+            self.cache.pool2_indices,
+            self.cache.grad_conv2,
+            batch_size,
+            8,
+            8,
+            16,
+            2,
+            2,
+            2,
+            2,
+        );
+
+        applyReluBackward(self.cache.grad_conv2, self.cache.conv2_out);
+
+        // === Conv2 backward ===
+        conv2d.conv2dBackwardInputParallel(
+            f32,
+            pool,
+            self.cache.grad_conv2,
+            self.weights.conv2_weight,
+            self.cache.grad_pool1,
+            batch_size,
+            12,
+            12,
+            6,
+            16,
+            5,
+            5,
+            1,
+            1,
+            0,
+            0,
+        );
+        try conv2d.conv2dBackwardWeightParallel(
+            f32,
+            pool,
+            self.allocator,
+            self.cache.pool1_out,
+            self.cache.grad_conv2,
+            self.grads.conv2_weight,
+            self.grads.conv2_bias,
+            batch_size,
+            12,
+            12,
+            6,
+            16,
+            5,
+            5,
+            1,
+            1,
+            0,
+            0,
+        );
+
+        // === MaxPool1 backward ===
+        maxpool.maxPool2dBackward(
+            f32,
+            self.cache.grad_pool1,
+            self.cache.pool1_indices,
+            self.cache.grad_conv1,
+            batch_size,
+            24,
+            24,
+            6,
+            2,
+            2,
+            2,
+            2,
+        );
+
+        applyReluBackward(self.cache.grad_conv1, self.cache.conv1_out);
+
+        // === Conv1 backward (only weight, not input) ===
+        try conv2d.conv2dBackwardWeightParallel(
+            f32,
+            pool,
+            self.allocator,
             input,
             self.cache.grad_conv1,
             self.grads.conv1_weight,
@@ -658,7 +950,7 @@ test "lenet forward shape" {
     const allocator = std.testing.allocator;
     const config = LeNetConfig{ .batch_size = 2 };
 
-    var model = try LeNet.init(allocator, config);
+    var model = try LeNet.init(allocator, config, null);
     defer model.deinit();
 
     // Random initialization
@@ -680,7 +972,7 @@ test "lenet backward runs" {
     const allocator = std.testing.allocator;
     const config = LeNetConfig{ .batch_size = 2 };
 
-    var model = try LeNet.init(allocator, config);
+    var model = try LeNet.init(allocator, config, null);
     defer model.deinit();
 
     var prng = std.Random.DefaultPrng.init(42);
@@ -701,7 +993,7 @@ test "lenet backward runs" {
     model.computeLossGradient(&targets, 2);
 
     // Backward
-    model.backward(&input, 2);
+    try model.backward(&input, 2);
 
     // Check that gradients are non-zero
     var has_nonzero: bool = false;
@@ -718,7 +1010,7 @@ test "lenet loss decreases" {
     const allocator = std.testing.allocator;
     const config = LeNetConfig{ .batch_size = 4 };
 
-    var model = try LeNet.init(allocator, config);
+    var model = try LeNet.init(allocator, config, null);
     defer model.deinit();
 
     var prng = std.Random.DefaultPrng.init(42);
@@ -740,7 +1032,7 @@ test "lenet loss decreases" {
         _ = model.forward(&input, 4);
         model.grads.zero();
         model.computeLossGradient(&targets, 4);
-        model.backward(&input, 4);
+        try model.backward(&input, 4);
 
         // SGD update (inline)
         updateParams(model.weights.conv1_weight, model.grads.conv1_weight, lr);

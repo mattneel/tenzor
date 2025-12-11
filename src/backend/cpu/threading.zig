@@ -112,6 +112,46 @@ pub const ThreadPool = struct {
     pub fn getThreadCount(self: *const Self) u32 {
         return self.thread_count;
     }
+
+    /// Execute a function in parallel over batches where each batch item is significant work.
+    /// Unlike parallelFor, this doesn't check MIN_PARALLEL_SIZE since batch-level
+    /// parallelism is worth it when batch >= thread_count.
+    pub fn parallelForBatch(
+        self: *Self,
+        batch_size: usize,
+        context: anytype,
+        comptime func: fn (@TypeOf(context), usize, usize) void,
+    ) void {
+        if (batch_size == 0) return;
+
+        // For single-threaded or tiny batches, run sequentially
+        if (builtin.single_threaded or self.thread_count <= 1 or batch_size < 2) {
+            func(context, 0, batch_size);
+            return;
+        }
+
+        // Divide batches among threads
+        const batches_per_thread = (batch_size + self.thread_count - 1) / self.thread_count;
+
+        var wg: std.Thread.WaitGroup = .{};
+        var batch_start: usize = 0;
+
+        while (batch_start < batch_size) {
+            const batch_end = @min(batch_start + batches_per_thread, batch_size);
+            const bs = batch_start;
+            const be = batch_end;
+
+            self.pool.spawnWg(&wg, struct {
+                fn work(ctx: @TypeOf(context), s: usize, e: usize) void {
+                    func(ctx, s, e);
+                }
+            }.work, .{ context, bs, be });
+
+            batch_start = batch_end;
+        }
+
+        self.pool.waitAndWork(&wg);
+    }
 };
 
 /// Partition work into chunks suitable for parallel execution.

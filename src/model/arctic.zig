@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const safetensors = @import("../io/safetensors.zig");
+const threading = @import("../backend/cpu/threading.zig");
 const kernels = struct {
     const matmul = @import("../backend/cpu/kernels/matmul.zig");
     const softmax = @import("../backend/cpu/kernels/softmax.zig");
@@ -237,7 +238,14 @@ pub const InferenceContext = struct {
 
     max_seq_len: usize,
 
+    // Thread pool for parallel execution (optional)
+    pool: ?*threading.ThreadPool,
+
     pub fn init(allocator: std.mem.Allocator, config: Config, max_seq_len: usize) !InferenceContext {
+        return initWithPool(allocator, config, max_seq_len, null);
+    }
+
+    pub fn initWithPool(allocator: std.mem.Allocator, config: Config, max_seq_len: usize, pool: ?*threading.ThreadPool) !InferenceContext {
         const h = config.hidden_size;
         const inter = config.intermediate_size;
         const heads = config.num_attention_heads;
@@ -255,6 +263,7 @@ pub const InferenceContext = struct {
             .encoder_output = try allocator.alloc(f32, max_seq_len * h),
             .layer_input = try allocator.alloc(f32, max_seq_len * h),
             .max_seq_len = max_seq_len,
+            .pool = pool,
         };
     }
 
@@ -273,11 +282,12 @@ pub const InferenceContext = struct {
 
 /// Apply embeddings: word + position + token_type + LayerNorm.
 /// Output: [seq_len, hidden_size]
-pub fn embeddings(
+pub fn embeddingsImpl(
     output: []f32,
     token_ids: []const u32,
     weights: EmbeddingWeights,
     config: Config,
+    pool: ?*threading.ThreadPool,
 ) void {
     const seq_len = token_ids.len;
     const h = config.hidden_size;
@@ -296,17 +306,42 @@ pub fn embeddings(
         }
     }
 
-    // Apply LayerNorm in-place
-    kernels.layernorm.layerNormLastDim(
-        f32,
-        output[0 .. seq_len * h],
-        weights.layer_norm_gamma,
-        weights.layer_norm_beta,
-        output[0 .. seq_len * h],
-        2,
-        .{ seq_len, h },
-        config.layer_norm_eps,
-    );
+    // Apply LayerNorm in-place (use parallel version if pool available)
+    if (pool) |p| {
+        kernels.layernorm.layerNormLastDimParallel(
+            f32,
+            output[0 .. seq_len * h],
+            weights.layer_norm_gamma,
+            weights.layer_norm_beta,
+            output[0 .. seq_len * h],
+            2,
+            .{ seq_len, h },
+            config.layer_norm_eps,
+            p,
+        );
+    } else {
+        kernels.layernorm.layerNormLastDim(
+            f32,
+            output[0 .. seq_len * h],
+            weights.layer_norm_gamma,
+            weights.layer_norm_beta,
+            output[0 .. seq_len * h],
+            2,
+            .{ seq_len, h },
+            config.layer_norm_eps,
+        );
+    }
+}
+
+/// Apply embeddings: word + position + token_type + LayerNorm (sequential version).
+/// Output: [seq_len, hidden_size]
+pub fn embeddings(
+    output: []f32,
+    token_ids: []const u32,
+    weights: EmbeddingWeights,
+    config: Config,
+) void {
+    embeddingsImpl(output, token_ids, weights, config, null);
 }
 
 /// Linear projection: Y = XW^T + b (BERT weights are stored transposed)
@@ -418,16 +453,31 @@ pub fn selfAttention(
     for (0..seq_len * h) |i| {
         output[i] = input[i] + ctx.tmp[i];
     }
-    kernels.layernorm.layerNormLastDim(
-        f32,
-        output[0 .. seq_len * h],
-        attn.output_ln_gamma,
-        attn.output_ln_beta,
-        output[0 .. seq_len * h],
-        2,
-        .{ seq_len, h },
-        ctx.config.layer_norm_eps,
-    );
+
+    if (ctx.pool) |p| {
+        kernels.layernorm.layerNormLastDimParallel(
+            f32,
+            output[0 .. seq_len * h],
+            attn.output_ln_gamma,
+            attn.output_ln_beta,
+            output[0 .. seq_len * h],
+            2,
+            .{ seq_len, h },
+            ctx.config.layer_norm_eps,
+            p,
+        );
+    } else {
+        kernels.layernorm.layerNormLastDim(
+            f32,
+            output[0 .. seq_len * h],
+            attn.output_ln_gamma,
+            attn.output_ln_beta,
+            output[0 .. seq_len * h],
+            2,
+            .{ seq_len, h },
+            ctx.config.layer_norm_eps,
+        );
+    }
 }
 
 /// GELU activation (approximation used by BERT).
@@ -466,16 +516,31 @@ pub fn feedForward(
     for (0..seq_len * h) |i| {
         output[i] = input[i] + ctx.tmp[i];
     }
-    kernels.layernorm.layerNormLastDim(
-        f32,
-        output[0 .. seq_len * h],
-        ffn.output_ln_gamma,
-        ffn.output_ln_beta,
-        output[0 .. seq_len * h],
-        2,
-        .{ seq_len, h },
-        ctx.config.layer_norm_eps,
-    );
+
+    if (ctx.pool) |p| {
+        kernels.layernorm.layerNormLastDimParallel(
+            f32,
+            output[0 .. seq_len * h],
+            ffn.output_ln_gamma,
+            ffn.output_ln_beta,
+            output[0 .. seq_len * h],
+            2,
+            .{ seq_len, h },
+            ctx.config.layer_norm_eps,
+            p,
+        );
+    } else {
+        kernels.layernorm.layerNormLastDim(
+            f32,
+            output[0 .. seq_len * h],
+            ffn.output_ln_gamma,
+            ffn.output_ln_beta,
+            output[0 .. seq_len * h],
+            2,
+            .{ seq_len, h },
+            ctx.config.layer_norm_eps,
+        );
+    }
 }
 
 /// Single transformer block forward pass.
@@ -553,8 +618,8 @@ pub fn forward(
     const hidden_states = ctx.encoder_input[0 .. seq_len * h];
     const enc_output = ctx.encoder_output[0 .. seq_len * h];
 
-    // Step 1: Embeddings
-    embeddings(hidden_states, token_ids, weights.embeddings, ctx.config);
+    // Step 1: Embeddings (uses parallel layernorm if pool available)
+    embeddingsImpl(hidden_states, token_ids, weights.embeddings, ctx.config, ctx.pool);
 
     // Step 2: Encoder (all transformer layers)
     encoder(enc_output, hidden_states, weights, ctx, seq_len);
@@ -584,6 +649,98 @@ pub fn forwardBatch(
             ctx,
         );
     }
+}
+
+/// Batch inference context pool - holds multiple contexts for parallel batch processing.
+pub const BatchContextPool = struct {
+    contexts: []InferenceContext,
+    allocator: std.mem.Allocator,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        config: Config,
+        max_seq_len: usize,
+        num_contexts: usize,
+        pool: ?*threading.ThreadPool,
+    ) !BatchContextPool {
+        const contexts = try allocator.alloc(InferenceContext, num_contexts);
+        errdefer allocator.free(contexts);
+
+        for (contexts, 0..) |*ctx, i| {
+            ctx.* = try InferenceContext.initWithPool(allocator, config, max_seq_len, pool);
+            errdefer {
+                for (contexts[0..i]) |*c| c.deinit();
+            }
+        }
+
+        return .{
+            .contexts = contexts,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *BatchContextPool) void {
+        for (self.contexts) |*ctx| {
+            ctx.deinit();
+        }
+        self.allocator.free(self.contexts);
+    }
+};
+
+/// Parallel batch inference: process multiple sequences across threads.
+/// Each thread uses its own InferenceContext from the pool.
+/// Requires a BatchContextPool with at least as many contexts as threads.
+pub fn forwardBatchParallel(
+    outputs: []f32, // [batch_size * hidden_size]
+    token_ids_batch: []const []const u32,
+    weights: ModelWeights,
+    ctx_pool: *BatchContextPool,
+    pool: *threading.ThreadPool,
+) void {
+    const batch_size = token_ids_batch.len;
+    if (batch_size == 0) return;
+
+    const h = weights.config.hidden_size;
+    const num_contexts = ctx_pool.contexts.len;
+
+    // Compute items per worker to determine context assignment
+    const items_per_worker = (batch_size + num_contexts - 1) / num_contexts;
+
+    const Context = struct {
+        outputs: []f32,
+        token_ids_batch: []const []const u32,
+        weights: ModelWeights,
+        ctx_pool: *BatchContextPool,
+        h: usize,
+        items_per_worker: usize,
+    };
+
+    const ctx = Context{
+        .outputs = outputs,
+        .token_ids_batch = token_ids_batch,
+        .weights = weights,
+        .ctx_pool = ctx_pool,
+        .h = h,
+        .items_per_worker = items_per_worker,
+    };
+
+    pool.parallelForBatch(batch_size, ctx, struct {
+        fn work(c: Context, start: usize, end: usize) void {
+            // Compute worker index from start position
+            const worker_idx = start / c.items_per_worker;
+            const ctx_idx = worker_idx % c.ctx_pool.contexts.len;
+            const local_ctx = &c.ctx_pool.contexts[ctx_idx];
+
+            for (start..end) |batch_idx| {
+                forward(
+                    c.outputs[batch_idx * c.h ..][0..c.h],
+                    c.token_ids_batch[batch_idx],
+                    c.weights,
+                    local_ctx,
+                );
+            }
+        }
+    }.work);
 }
 
 // ============================================================================

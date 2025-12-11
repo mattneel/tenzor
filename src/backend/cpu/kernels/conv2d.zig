@@ -5,8 +5,11 @@
 //! - Backward: dX = conv2d_transpose(dY, W), dW = conv2d(X^T, dY), db = sum(dY)
 //!
 //! Layout: NHWC (batch, height, width, channels) - CPU/SIMD friendly
+//!
+//! Parallel versions available: conv2dForwardParallel, etc.
 
 const std = @import("std");
+const threading = @import("../threading.zig");
 
 /// Compute output dimension for convolution.
 pub fn convOutputSize(
@@ -228,6 +231,553 @@ pub fn conv2dBackwardWeight(
                                     const w_idx = ((oc * kernel_h + kh) * kernel_w + kw) * in_c + ic;
                                     grad_weight[w_idx] += grad_out_val * input[in_idx];
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Parallel versions (using ThreadPool)
+// ============================================================================
+
+/// Parallel 2D Convolution forward pass.
+/// Parallelizes over the batch dimension.
+pub fn conv2dForwardParallel(
+    comptime T: type,
+    pool: *threading.ThreadPool,
+    input: []const T,
+    weight: []const T,
+    bias: ?[]const T,
+    output: []T,
+    batch: usize,
+    in_h: usize,
+    in_w: usize,
+    in_c: usize,
+    out_c: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) void {
+    const out_h = convOutputSize(in_h, kernel_h, stride_h, pad_h);
+    const out_w = convOutputSize(in_w, kernel_w, stride_w, pad_w);
+    const in_batch_size = in_h * in_w * in_c;
+    const out_batch_size = out_h * out_w * out_c;
+
+    const Context = struct {
+        input: []const T,
+        weight: []const T,
+        bias: ?[]const T,
+        output: []T,
+        in_h: usize,
+        in_w: usize,
+        in_c: usize,
+        out_c: usize,
+        out_h: usize,
+        out_w: usize,
+        kernel_h: usize,
+        kernel_w: usize,
+        stride_h: usize,
+        stride_w: usize,
+        pad_h: usize,
+        pad_w: usize,
+        in_batch_size: usize,
+        out_batch_size: usize,
+    };
+
+    const ctx = Context{
+        .input = input,
+        .weight = weight,
+        .bias = bias,
+        .output = output,
+        .in_h = in_h,
+        .in_w = in_w,
+        .in_c = in_c,
+        .out_c = out_c,
+        .out_h = out_h,
+        .out_w = out_w,
+        .kernel_h = kernel_h,
+        .kernel_w = kernel_w,
+        .stride_h = stride_h,
+        .stride_w = stride_w,
+        .pad_h = pad_h,
+        .pad_w = pad_w,
+        .in_batch_size = in_batch_size,
+        .out_batch_size = out_batch_size,
+    };
+
+    pool.parallelForBatch(batch, ctx, struct {
+        fn work(c: Context, start: usize, end: usize) void {
+            for (start..end) |n| {
+                conv2dForwardSingle(
+                    T,
+                    c.input[n * c.in_batch_size ..][0..c.in_batch_size],
+                    c.weight,
+                    c.bias,
+                    c.output[n * c.out_batch_size ..][0..c.out_batch_size],
+                    c.in_h,
+                    c.in_w,
+                    c.in_c,
+                    c.out_c,
+                    c.out_h,
+                    c.out_w,
+                    c.kernel_h,
+                    c.kernel_w,
+                    c.stride_h,
+                    c.stride_w,
+                    c.pad_h,
+                    c.pad_w,
+                );
+            }
+        }
+    }.work);
+}
+
+/// Single-sample forward pass (helper for parallel version).
+fn conv2dForwardSingle(
+    comptime T: type,
+    input: []const T,
+    weight: []const T,
+    bias: ?[]const T,
+    output: []T,
+    in_h: usize,
+    in_w: usize,
+    in_c: usize,
+    out_c: usize,
+    out_h: usize,
+    out_w: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) void {
+    // Initialize output with bias (or zeros)
+    if (bias) |b| {
+        for (0..out_h) |oh| {
+            for (0..out_w) |ow| {
+                for (0..out_c) |oc| {
+                    const out_idx = (oh * out_w + ow) * out_c + oc;
+                    output[out_idx] = b[oc];
+                }
+            }
+        }
+    } else {
+        @memset(output, 0);
+    }
+
+    // Convolution
+    for (0..out_h) |oh| {
+        for (0..out_w) |ow| {
+            const ih_start = oh * stride_h;
+            const iw_start = ow * stride_w;
+
+            for (0..out_c) |oc| {
+                var sum: T = 0;
+
+                for (0..kernel_h) |kh| {
+                    for (0..kernel_w) |kw| {
+                        const ih = ih_start + kh;
+                        const iw = iw_start + kw;
+
+                        if (ih >= pad_h and ih < in_h + pad_h and
+                            iw >= pad_w and iw < in_w + pad_w)
+                        {
+                            const ih_actual = ih - pad_h;
+                            const iw_actual = iw - pad_w;
+
+                            for (0..in_c) |ic| {
+                                const in_idx = (ih_actual * in_w + iw_actual) * in_c + ic;
+                                const w_idx = ((oc * kernel_h + kh) * kernel_w + kw) * in_c + ic;
+                                sum += input[in_idx] * weight[w_idx];
+                            }
+                        }
+                    }
+                }
+
+                const out_idx = (oh * out_w + ow) * out_c + oc;
+                output[out_idx] += sum;
+            }
+        }
+    }
+}
+
+/// Parallel backward pass for input gradient.
+pub fn conv2dBackwardInputParallel(
+    comptime T: type,
+    pool: *threading.ThreadPool,
+    grad_output: []const T,
+    weight: []const T,
+    grad_input: []T,
+    batch: usize,
+    in_h: usize,
+    in_w: usize,
+    in_c: usize,
+    out_c: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) void {
+    const out_h = convOutputSize(in_h, kernel_h, stride_h, pad_h);
+    const out_w = convOutputSize(in_w, kernel_w, stride_w, pad_w);
+    const in_batch_size = in_h * in_w * in_c;
+    const out_batch_size = out_h * out_w * out_c;
+
+    const Context = struct {
+        grad_output: []const T,
+        weight: []const T,
+        grad_input: []T,
+        in_h: usize,
+        in_w: usize,
+        in_c: usize,
+        out_c: usize,
+        out_h: usize,
+        out_w: usize,
+        kernel_h: usize,
+        kernel_w: usize,
+        stride_h: usize,
+        stride_w: usize,
+        pad_h: usize,
+        pad_w: usize,
+        in_batch_size: usize,
+        out_batch_size: usize,
+    };
+
+    const ctx = Context{
+        .grad_output = grad_output,
+        .weight = weight,
+        .grad_input = grad_input,
+        .in_h = in_h,
+        .in_w = in_w,
+        .in_c = in_c,
+        .out_c = out_c,
+        .out_h = out_h,
+        .out_w = out_w,
+        .kernel_h = kernel_h,
+        .kernel_w = kernel_w,
+        .stride_h = stride_h,
+        .stride_w = stride_w,
+        .pad_h = pad_h,
+        .pad_w = pad_w,
+        .in_batch_size = in_batch_size,
+        .out_batch_size = out_batch_size,
+    };
+
+    pool.parallelForBatch(batch, ctx, struct {
+        fn work(c: Context, start: usize, end: usize) void {
+            for (start..end) |n| {
+                conv2dBackwardInputSingle(
+                    T,
+                    c.grad_output[n * c.out_batch_size ..][0..c.out_batch_size],
+                    c.weight,
+                    c.grad_input[n * c.in_batch_size ..][0..c.in_batch_size],
+                    c.in_h,
+                    c.in_w,
+                    c.in_c,
+                    c.out_c,
+                    c.out_h,
+                    c.out_w,
+                    c.kernel_h,
+                    c.kernel_w,
+                    c.stride_h,
+                    c.stride_w,
+                    c.pad_h,
+                    c.pad_w,
+                );
+            }
+        }
+    }.work);
+}
+
+/// Single-sample backward input (helper for parallel version).
+fn conv2dBackwardInputSingle(
+    comptime T: type,
+    grad_output: []const T,
+    weight: []const T,
+    grad_input: []T,
+    in_h: usize,
+    in_w: usize,
+    in_c: usize,
+    out_c: usize,
+    out_h: usize,
+    out_w: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) void {
+    @memset(grad_input, 0);
+
+    for (0..out_h) |oh| {
+        for (0..out_w) |ow| {
+            const ih_start = oh * stride_h;
+            const iw_start = ow * stride_w;
+
+            for (0..out_c) |oc| {
+                const grad_out_idx = (oh * out_w + ow) * out_c + oc;
+                const grad_out_val = grad_output[grad_out_idx];
+
+                for (0..kernel_h) |kh| {
+                    for (0..kernel_w) |kw| {
+                        const ih = ih_start + kh;
+                        const iw = iw_start + kw;
+
+                        if (ih >= pad_h and ih < in_h + pad_h and
+                            iw >= pad_w and iw < in_w + pad_w)
+                        {
+                            const ih_actual = ih - pad_h;
+                            const iw_actual = iw - pad_w;
+
+                            for (0..in_c) |ic| {
+                                const in_idx = (ih_actual * in_w + iw_actual) * in_c + ic;
+                                const w_idx = ((oc * kernel_h + kh) * kernel_w + kw) * in_c + ic;
+                                grad_input[in_idx] += grad_out_val * weight[w_idx];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parallel backward pass for weight gradient.
+/// Note: Weight gradients are accumulated across batches, so we parallelize
+/// over batches and use thread-local accumulators then reduce.
+pub fn conv2dBackwardWeightParallel(
+    comptime T: type,
+    pool: *threading.ThreadPool,
+    allocator: std.mem.Allocator,
+    input: []const T,
+    grad_output: []const T,
+    grad_weight: []T,
+    grad_bias: ?[]T,
+    batch: usize,
+    in_h: usize,
+    in_w: usize,
+    in_c: usize,
+    out_c: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) !void {
+    const out_h = convOutputSize(in_h, kernel_h, stride_h, pad_h);
+    const out_w = convOutputSize(in_w, kernel_w, stride_w, pad_w);
+    const in_batch_size = in_h * in_w * in_c;
+    const out_batch_size = out_h * out_w * out_c;
+    const weight_size = out_c * kernel_h * kernel_w * in_c;
+
+    // For small batches, use sequential to avoid allocation overhead
+    if (batch < pool.getThreadCount() * 2) {
+        conv2dBackwardWeight(
+            T,
+            input,
+            grad_output,
+            grad_weight,
+            grad_bias,
+            batch,
+            in_h,
+            in_w,
+            in_c,
+            out_c,
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+            pad_h,
+            pad_w,
+        );
+        return;
+    }
+
+    // Allocate per-thread accumulators
+    const num_threads = pool.getThreadCount();
+    const thread_grad_weights = try allocator.alloc([]T, num_threads);
+    defer allocator.free(thread_grad_weights);
+
+    const thread_grad_biases: ?[][]T = if (grad_bias != null)
+        try allocator.alloc([]T, num_threads)
+    else
+        null;
+    defer if (thread_grad_biases) |tgb| allocator.free(tgb);
+
+    // Initialize thread-local buffers
+    for (0..num_threads) |t| {
+        thread_grad_weights[t] = try allocator.alloc(T, weight_size);
+        @memset(thread_grad_weights[t], 0);
+        if (thread_grad_biases) |tgb| {
+            tgb[t] = try allocator.alloc(T, out_c);
+            @memset(tgb[t], 0);
+        }
+    }
+    defer for (0..num_threads) |t| {
+        allocator.free(thread_grad_weights[t]);
+        if (thread_grad_biases) |tgb| allocator.free(tgb[t]);
+    };
+
+    const Context = struct {
+        input: []const T,
+        grad_output: []const T,
+        thread_grad_weights: [][]T,
+        thread_grad_biases: ?[][]T,
+        in_h: usize,
+        in_w: usize,
+        in_c: usize,
+        out_c: usize,
+        out_h: usize,
+        out_w: usize,
+        kernel_h: usize,
+        kernel_w: usize,
+        stride_h: usize,
+        stride_w: usize,
+        pad_h: usize,
+        pad_w: usize,
+        in_batch_size: usize,
+        out_batch_size: usize,
+        num_threads: usize,
+        batch: usize,
+    };
+
+    const ctx = Context{
+        .input = input,
+        .grad_output = grad_output,
+        .thread_grad_weights = thread_grad_weights,
+        .thread_grad_biases = thread_grad_biases,
+        .in_h = in_h,
+        .in_w = in_w,
+        .in_c = in_c,
+        .out_c = out_c,
+        .out_h = out_h,
+        .out_w = out_w,
+        .kernel_h = kernel_h,
+        .kernel_w = kernel_w,
+        .stride_h = stride_h,
+        .stride_w = stride_w,
+        .pad_h = pad_h,
+        .pad_w = pad_w,
+        .in_batch_size = in_batch_size,
+        .out_batch_size = out_batch_size,
+        .num_threads = num_threads,
+        .batch = batch,
+    };
+
+    // Each thread processes a range of batches
+    pool.parallelForBatch(num_threads, ctx, struct {
+        fn work(c: Context, start: usize, end: usize) void {
+            _ = end;
+            const thread_id = start;
+            const batches_per_thread = (c.batch + c.num_threads - 1) / c.num_threads;
+            const batch_start = thread_id * batches_per_thread;
+            const batch_end = @min(batch_start + batches_per_thread, c.batch);
+
+            const my_grad_weight = c.thread_grad_weights[thread_id];
+            const my_grad_bias: ?[]T = if (c.thread_grad_biases) |tgb| tgb[thread_id] else null;
+
+            for (batch_start..batch_end) |n| {
+                conv2dBackwardWeightSingle(
+                    T,
+                    c.input[n * c.in_batch_size ..][0..c.in_batch_size],
+                    c.grad_output[n * c.out_batch_size ..][0..c.out_batch_size],
+                    my_grad_weight,
+                    my_grad_bias,
+                    c.in_h,
+                    c.in_w,
+                    c.in_c,
+                    c.out_c,
+                    c.out_h,
+                    c.out_w,
+                    c.kernel_h,
+                    c.kernel_w,
+                    c.stride_h,
+                    c.stride_w,
+                    c.pad_h,
+                    c.pad_w,
+                );
+            }
+        }
+    }.work);
+
+    // Reduce thread-local gradients into output
+    @memset(grad_weight, 0);
+    if (grad_bias) |gb| @memset(gb, 0);
+
+    for (0..num_threads) |t| {
+        for (grad_weight, thread_grad_weights[t]) |*gw, tgw| {
+            gw.* += tgw;
+        }
+        if (grad_bias) |gb| {
+            if (thread_grad_biases) |tgb| {
+                for (gb, tgb[t]) |*b, tb| {
+                    b.* += tb;
+                }
+            }
+        }
+    }
+}
+
+/// Single-sample backward weight (helper for parallel version).
+fn conv2dBackwardWeightSingle(
+    comptime T: type,
+    input: []const T,
+    grad_output: []const T,
+    grad_weight: []T,
+    grad_bias: ?[]T,
+    in_h: usize,
+    in_w: usize,
+    in_c: usize,
+    out_c: usize,
+    out_h: usize,
+    out_w: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    pad_h: usize,
+    pad_w: usize,
+) void {
+    for (0..out_h) |oh| {
+        for (0..out_w) |ow| {
+            const ih_start = oh * stride_h;
+            const iw_start = ow * stride_w;
+
+            for (0..out_c) |oc| {
+                const grad_out_idx = (oh * out_w + ow) * out_c + oc;
+                const grad_out_val = grad_output[grad_out_idx];
+
+                if (grad_bias) |gb| {
+                    gb[oc] += grad_out_val;
+                }
+
+                for (0..kernel_h) |kh| {
+                    for (0..kernel_w) |kw| {
+                        const ih = ih_start + kh;
+                        const iw = iw_start + kw;
+
+                        if (ih >= pad_h and ih < in_h + pad_h and
+                            iw >= pad_w and iw < in_w + pad_w)
+                        {
+                            const ih_actual = ih - pad_h;
+                            const iw_actual = iw - pad_w;
+
+                            for (0..in_c) |ic| {
+                                const in_idx = (ih_actual * in_w + iw_actual) * in_c + ic;
+                                const w_idx = ((oc * kernel_h + kh) * kernel_w + kw) * in_c + ic;
+                                grad_weight[w_idx] += grad_out_val * input[in_idx];
                             }
                         }
                     }

@@ -19,7 +19,7 @@ test "lenet overfit single batch" {
         .batch_size = 8,
     };
 
-    var model = try lenet.LeNet.init(allocator, config);
+    var model = try lenet.LeNet.init(allocator, config, null);
     defer model.deinit();
 
     // Initialize weights
@@ -45,7 +45,7 @@ test "lenet overfit single batch" {
         _ = model.forward(&input, 8);
         model.grads.zero();
         model.computeLossGradient(&targets, 8);
-        model.backward(&input, 8);
+        try model.backward(&input, 8);
 
         // SGD update
         sgdUpdate(&model, lr);
@@ -67,7 +67,7 @@ test "lenet gradient magnitudes" {
     const allocator = std.testing.allocator;
 
     const config = lenet.LeNetConfig{ .batch_size = 4 };
-    var model = try lenet.LeNet.init(allocator, config);
+    var model = try lenet.LeNet.init(allocator, config, null);
     defer model.deinit();
 
     var prng = std.Random.DefaultPrng.init(42);
@@ -80,7 +80,7 @@ test "lenet gradient magnitudes" {
     _ = model.forward(&input, 4);
     model.grads.zero();
     model.computeLossGradient(&targets, 4);
-    model.backward(&input, 4);
+    try model.backward(&input, 4);
 
     // Check gradient magnitudes are reasonable (not NaN, not too large)
     const grad_norm = computeGradNorm(&model);
@@ -94,7 +94,7 @@ test "lenet accuracy improves" {
     const allocator = std.testing.allocator;
 
     const config = lenet.LeNetConfig{ .batch_size = 16 };
-    var model = try lenet.LeNet.init(allocator, config);
+    var model = try lenet.LeNet.init(allocator, config, null);
     defer model.deinit();
 
     var prng = std.Random.DefaultPrng.init(999);
@@ -125,7 +125,7 @@ test "lenet accuracy improves" {
         _ = model.forward(&input, 16);
         model.grads.zero();
         model.computeLossGradient(&targets, 16);
-        model.backward(&input, 16);
+        try model.backward(&input, 16);
         sgdUpdate(&model, lr);
     }
 

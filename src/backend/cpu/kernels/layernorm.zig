@@ -4,9 +4,12 @@
 //! Applied over the last `normalized_dims` dimensions.
 //!
 //! Standard epsilon: 1e-5 (same as PyTorch default)
+//!
+//! Parallel versions available for multi-threaded execution.
 
 const std = @import("std");
 const simd = @import("../simd.zig");
+const threading = @import("../threading.zig");
 
 /// Default epsilon for numerical stability.
 pub const default_eps: f32 = 1e-5;
@@ -180,6 +183,227 @@ pub fn layerNorm(
             out.* = normalized * g + b;
         }
     }
+}
+
+// ============================================================================
+// Parallel Versions
+// ============================================================================
+
+/// Process a single instance of layer normalization (helper for parallel version).
+fn layerNormLastDimSingle(
+    comptime T: type,
+    x: []const T,
+    gamma: []const T,
+    beta: []const T,
+    y: []T,
+    eps: T,
+) void {
+    const normalized_size = x.len;
+    const vec_len = simd.suggestVectorLength(T);
+
+    // Step 1: Compute mean
+    var sum: T = 0;
+    var i: usize = 0;
+
+    // SIMD sum
+    var sum_vec = simd.splat(T, 0);
+    while (i + vec_len <= normalized_size) : (i += vec_len) {
+        const v = simd.load(T, x[i..]);
+        sum_vec = simd.add(T, sum_vec, v);
+    }
+    sum = simd.reduceAdd(T, sum_vec);
+
+    // Scalar remainder
+    while (i < normalized_size) : (i += 1) {
+        sum += x[i];
+    }
+
+    const mean = sum / @as(T, @floatFromInt(normalized_size));
+
+    // Step 2: Compute variance = mean((x - mean)^2)
+    var var_sum: T = 0;
+    i = 0;
+
+    const mean_vec = simd.splat(T, mean);
+    var var_sum_vec = simd.splat(T, 0);
+    while (i + vec_len <= normalized_size) : (i += vec_len) {
+        const v = simd.load(T, x[i..]);
+        const diff = simd.sub(T, v, mean_vec);
+        const sq = simd.mul(T, diff, diff);
+        var_sum_vec = simd.add(T, var_sum_vec, sq);
+    }
+    var_sum = simd.reduceAdd(T, var_sum_vec);
+
+    while (i < normalized_size) : (i += 1) {
+        const diff = x[i] - mean;
+        var_sum += diff * diff;
+    }
+
+    const variance = var_sum / @as(T, @floatFromInt(normalized_size));
+
+    // Step 3 & 4: Normalize and scale/shift
+    const inv_std = 1.0 / @sqrt(variance + eps);
+    const inv_std_vec = simd.splat(T, inv_std);
+
+    i = 0;
+    while (i + vec_len <= normalized_size) : (i += vec_len) {
+        const v = simd.load(T, x[i..]);
+        const g = simd.load(T, gamma[i..]);
+        const b = simd.load(T, beta[i..]);
+
+        // normalized = (x - mean) * inv_std
+        const normalized = simd.mul(T, simd.sub(T, v, mean_vec), inv_std_vec);
+        // output = normalized * gamma + beta
+        const result = simd.add(T, simd.mul(T, normalized, g), b);
+        simd.store(T, result, y[i..]);
+    }
+
+    // Scalar remainder
+    while (i < normalized_size) : (i += 1) {
+        const normalized = (x[i] - mean) * inv_std;
+        y[i] = normalized * gamma[i] + beta[i];
+    }
+}
+
+/// Parallel layer normalization over the last dimension.
+/// Distributes instances across threads for multi-core execution.
+pub fn layerNormLastDimParallel(
+    comptime T: type,
+    input: []const T,
+    gamma: []const T,
+    beta: []const T,
+    output: []T,
+    comptime ndim: usize,
+    shape: [ndim]usize,
+    eps: T,
+    pool: *threading.ThreadPool,
+) void {
+    const normalized_size = shape[ndim - 1];
+    const num_instances = blk: {
+        var n: usize = 1;
+        for (0..ndim - 1) |i| {
+            n *= shape[i];
+        }
+        break :blk n;
+    };
+
+    const Context = struct {
+        input: []const T,
+        gamma: []const T,
+        beta: []const T,
+        output: []T,
+        normalized_size: usize,
+        eps: T,
+    };
+
+    const ctx = Context{
+        .input = input,
+        .gamma = gamma,
+        .beta = beta,
+        .output = output,
+        .normalized_size = normalized_size,
+        .eps = eps,
+    };
+
+    pool.parallelForBatch(num_instances, ctx, struct {
+        fn work(c: Context, start: usize, end: usize) void {
+            for (start..end) |inst| {
+                const offset = inst * c.normalized_size;
+                const x = c.input[offset..][0..c.normalized_size];
+                const y = c.output[offset..][0..c.normalized_size];
+                layerNormLastDimSingle(T, x, c.gamma, c.beta, y, c.eps);
+            }
+        }
+    }.work);
+}
+
+/// Parallel layer normalization over multiple trailing dimensions.
+pub fn layerNormParallel(
+    comptime T: type,
+    input: []const T,
+    gamma: []const T,
+    beta: []const T,
+    output: []T,
+    comptime ndim: usize,
+    shape: [ndim]usize,
+    comptime normalized_dims: usize,
+    eps: T,
+    pool: *threading.ThreadPool,
+) void {
+    // For the common case of normalizing just the last dim
+    if (normalized_dims == 1) {
+        layerNormLastDimParallel(T, input, gamma, beta, output, ndim, shape, eps, pool);
+        return;
+    }
+
+    // General case: compute normalized_size as product of last dims
+    const normalized_size = blk: {
+        var n: usize = 1;
+        for (ndim - normalized_dims..ndim) |i| {
+            n *= shape[i];
+        }
+        break :blk n;
+    };
+
+    const num_instances = blk: {
+        var n: usize = 1;
+        for (0..ndim - normalized_dims) |i| {
+            n *= shape[i];
+        }
+        break :blk n;
+    };
+
+    const inv_normalized_size = 1.0 / @as(T, @floatFromInt(normalized_size));
+
+    const Context = struct {
+        input: []const T,
+        gamma: []const T,
+        beta: []const T,
+        output: []T,
+        normalized_size: usize,
+        inv_normalized_size: T,
+        eps: T,
+    };
+
+    const ctx = Context{
+        .input = input,
+        .gamma = gamma,
+        .beta = beta,
+        .output = output,
+        .normalized_size = normalized_size,
+        .inv_normalized_size = inv_normalized_size,
+        .eps = eps,
+    };
+
+    pool.parallelForBatch(num_instances, ctx, struct {
+        fn work(c: Context, start: usize, end: usize) void {
+            for (start..end) |inst| {
+                const offset = inst * c.normalized_size;
+                const x = c.input[offset..][0..c.normalized_size];
+                const y = c.output[offset..][0..c.normalized_size];
+
+                // Compute mean
+                var sum: T = 0;
+                for (x) |v| sum += v;
+                const mean = sum * c.inv_normalized_size;
+
+                // Compute variance
+                var var_sum: T = 0;
+                for (x) |v| {
+                    const diff = v - mean;
+                    var_sum += diff * diff;
+                }
+                const variance = var_sum * c.inv_normalized_size;
+                const inv_std = 1.0 / @sqrt(variance + c.eps);
+
+                // Normalize and scale/shift
+                for (y, x, c.gamma, c.beta) |*out, in, g, b| {
+                    const normalized = (in - mean) * inv_std;
+                    out.* = normalized * g + b;
+                }
+            }
+        }
+    }.work);
 }
 
 // ============================================================================
