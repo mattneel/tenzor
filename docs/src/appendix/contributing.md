@@ -23,6 +23,17 @@ zig build
 zig build test
 ```
 
+### Generate Parity Test Fixtures (Optional)
+
+Some tests require fixtures from HuggingFace models:
+
+```bash
+pip install torch transformers safetensors
+python scripts/parity/arctic.py
+```
+
+See `scripts/parity/README.md` for details.
+
 ---
 
 ## Project Structure
@@ -42,12 +53,21 @@ tenzor/
 │   │       ├── dispatch.zig # Kernel dispatch
 │   │       ├── fusion.zig  # Fusion engine
 │   │       └── threading.zig # Thread pool
+│   ├── io/
+│   │   └── safetensors.zig # SafeTensors weight loader
+│   ├── model/
+│   │   └── arctic.zig      # Arctic embedding model
 │   ├── memory/
 │   │   ├── pool.zig        # Buffer pooling
 │   │   └── allocator.zig   # Pool allocator
+│   ├── tests/
+│   │   └── *_integration_test.zig  # Parity tests
 │   └── root.zig            # Public API
-├── tests/
-│   └── *.zig               # Test files
+├── scripts/
+│   └── parity/             # Fixture generators
+│       ├── README.md
+│       └── arctic.py       # Arctic fixtures
+├── test_fixtures/          # Generated (gitignored)
 ├── docs/
 │   └── src/                # Documentation
 ├── build.zig

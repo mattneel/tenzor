@@ -64,6 +64,11 @@
 - [Parallel Execution](./threading/parallel-execution.md)
 - [Work Partitioning](./threading/partitioning.md)
 
+# Models
+
+- [Overview](./models/overview.md)
+- [Arctic Embed XS](./models/arctic.md)
+
 # Advanced Topics
 
 - [Comptime Magic](./advanced/comptime.md)
