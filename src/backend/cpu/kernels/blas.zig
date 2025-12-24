@@ -10,6 +10,49 @@ const options = @import("tenzor_options");
 // CBLAS is optional; when unavailable at runtime we fall back to pure Zig kernels.
 pub const can_try_cblas = options.enable_blas and builtin.os.tag != .freestanding and builtin.cpu.arch != .wasm32;
 
+pub const Status = enum {
+    /// Build-time disabled (`-Dblas=false`).
+    disabled,
+    /// Platform/target unsupported (WASM/freestanding).
+    unsupported,
+    /// Enabled, but no compatible BLAS found at runtime.
+    unavailable,
+    /// Loaded from `TENZOR_BLAS_LIB`.
+    custom,
+    /// macOS Accelerate.framework.
+    accelerate,
+    /// OpenBLAS (or compatible).
+    openblas,
+    /// Intel MKL runtime.
+    mkl,
+    /// Generic CBLAS.
+    cblas,
+    /// Generic BLAS (with CBLAS symbols).
+    blas,
+};
+
+pub fn status() Status {
+    return Runtime.status();
+}
+
+pub fn statusString(s: Status) []const u8 {
+    return switch (s) {
+        .disabled => "disabled",
+        .unsupported => "unsupported",
+        .unavailable => "unavailable",
+        .custom => "custom",
+        .accelerate => "accelerate",
+        .openblas => "openblas",
+        .mkl => "mkl",
+        .cblas => "cblas",
+        .blas => "blas",
+    };
+}
+
+pub fn statusName() []const u8 {
+    return statusString(status());
+}
+
 const CblasSgemmFn = *const fn (
     layout: c_int,
     trans_a: c_int,
@@ -98,12 +141,14 @@ const Runtime = if (can_try_cblas) struct {
     const Loaded = struct {
         lib: std.DynLib,
         api: CblasApi,
+        status: Status,
     };
 
     var once = std.once(init);
     var loaded: bool = false;
     var lib: std.DynLib = undefined;
     var api_state: CblasApi = undefined;
+    var status_state: Status = .unavailable;
     var init_err: ?anyerror = null;
 
     fn init() void {
@@ -114,6 +159,7 @@ const Runtime = if (can_try_cblas) struct {
 
         lib = loaded_result.lib;
         api_state = loaded_result.api;
+        status_state = loaded_result.status;
         loaded = true;
     }
 
@@ -122,12 +168,18 @@ const Runtime = if (can_try_cblas) struct {
         return loaded;
     }
 
+    pub fn status() Status {
+        once.call();
+        if (!loaded) return .unavailable;
+        return status_state;
+    }
+
     pub fn apiPtr() ?*const CblasApi {
         if (!hasCblas()) return null;
         return &api_state;
     }
 
-    fn loadFromPath(path: []const u8) !Loaded {
+    fn loadFromPath(path: []const u8, loaded_status: Status) !Loaded {
         var dynlib = try std.DynLib.open(path);
         errdefer dynlib.close();
 
@@ -140,50 +192,52 @@ const Runtime = if (can_try_cblas) struct {
             .ddot = dynlib.lookup(CblasDdotFn, "cblas_ddot") orelse return error.MissingSymbol,
         };
 
-        return .{ .lib = dynlib, .api = api_loaded };
+        return .{ .lib = dynlib, .api = api_loaded, .status = loaded_status };
     }
 
     fn loadCblas() !Loaded {
         if (std.process.getEnvVarOwned(std.heap.page_allocator, "TENZOR_BLAS_LIB")) |path| {
             defer std.heap.page_allocator.free(path);
-            if (loadFromPath(path)) |loaded_result| return loaded_result else |_| {}
+            if (loadFromPath(path, .custom)) |loaded_result| return loaded_result else |_| {}
         } else |_| {}
 
+        const Candidate = struct { path: []const u8, status: Status };
+
         const candidates = switch (builtin.os.tag) {
-            .linux => &[_][]const u8{
-                "libopenblas.so.0",
-                "libopenblas.so",
-                "libopenblas64_.so.0",
-                "libopenblas64_.so",
-                "libopenblas64.so.0",
-                "libopenblas64.so",
-                "libopenblasp.so.0",
-                "libopenblasp.so",
-                "libcblas.so.3",
-                "libcblas.so",
-                "libblas.so.3",
-                "libblas.so",
-                "libmkl_rt.so",
+            .linux => &[_]Candidate{
+                .{ .path = "libopenblas.so.0", .status = .openblas },
+                .{ .path = "libopenblas.so", .status = .openblas },
+                .{ .path = "libopenblas64_.so.0", .status = .openblas },
+                .{ .path = "libopenblas64_.so", .status = .openblas },
+                .{ .path = "libopenblas64.so.0", .status = .openblas },
+                .{ .path = "libopenblas64.so", .status = .openblas },
+                .{ .path = "libopenblasp.so.0", .status = .openblas },
+                .{ .path = "libopenblasp.so", .status = .openblas },
+                .{ .path = "libcblas.so.3", .status = .cblas },
+                .{ .path = "libcblas.so", .status = .cblas },
+                .{ .path = "libblas.so.3", .status = .blas },
+                .{ .path = "libblas.so", .status = .blas },
+                .{ .path = "libmkl_rt.so", .status = .mkl },
             },
-            .macos => &[_][]const u8{
-                "/System/Library/Frameworks/Accelerate.framework/Accelerate",
-                "/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate",
-                "libopenblas.dylib",
-                "libcblas.dylib",
-                "libblas.dylib",
+            .macos => &[_]Candidate{
+                .{ .path = "/System/Library/Frameworks/Accelerate.framework/Accelerate", .status = .accelerate },
+                .{ .path = "/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate", .status = .accelerate },
+                .{ .path = "libopenblas.dylib", .status = .openblas },
+                .{ .path = "libcblas.dylib", .status = .cblas },
+                .{ .path = "libblas.dylib", .status = .blas },
             },
-            .windows => &[_][]const u8{
-                "openblas.dll",
-                "libopenblas.dll",
-                "openblas64_.dll",
-                "libopenblas64_.dll",
-                "mkl_rt.dll",
+            .windows => &[_]Candidate{
+                .{ .path = "openblas.dll", .status = .openblas },
+                .{ .path = "libopenblas.dll", .status = .openblas },
+                .{ .path = "openblas64_.dll", .status = .openblas },
+                .{ .path = "libopenblas64_.dll", .status = .openblas },
+                .{ .path = "mkl_rt.dll", .status = .mkl },
             },
-            else => &[_][]const u8{},
+            else => &[_]Candidate{},
         };
 
         for (candidates) |cand| {
-            if (loadFromPath(cand)) |loaded_result| return loaded_result else |_| {}
+            if (loadFromPath(cand.path, cand.status)) |loaded_result| return loaded_result else |_| {}
         }
 
         return error.BlasUnavailable;
@@ -191,6 +245,11 @@ const Runtime = if (can_try_cblas) struct {
 } else struct {
     pub fn hasCblas() bool {
         return false;
+    }
+
+    pub fn status() Status {
+        if (!options.enable_blas) return .disabled;
+        return .unsupported;
     }
 
     pub fn apiPtr() ?*const CblasApi {

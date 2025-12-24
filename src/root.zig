@@ -23,6 +23,7 @@ pub const backend = struct {
         pub const executor = @import("backend/cpu/executor.zig");
         pub const threading = @import("backend/cpu/threading.zig");
         pub const kernels = struct {
+            pub const blas = @import("backend/cpu/kernels/blas.zig");
             pub const elementwise = @import("backend/cpu/kernels/elementwise.zig");
             pub const matmul = @import("backend/cpu/kernels/matmul.zig");
             pub const reduce = @import("backend/cpu/kernels/reduce.zig");
