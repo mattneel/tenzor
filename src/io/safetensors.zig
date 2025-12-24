@@ -112,10 +112,34 @@ pub const SafeTensors = struct {
     }
 
     /// Get raw tensor data as typed slice.
+    /// Note: Returns a slice into the original data. The data must be properly aligned
+    /// for the target type. Use getDataAlloc for unaligned sources like @embedFile.
     pub fn getData(self: SafeTensors, comptime T: type, info: TensorInfo) []const T {
         const byte_data = self.data[self.header_size + 8 + info.data_start ..][0..info.byteSize()];
-        const aligned: []align(@alignOf(T)) const u8 = @alignCast(byte_data);
-        return std.mem.bytesAsSlice(T, aligned);
+        // Check alignment at runtime to provide better error message
+        if (@intFromPtr(byte_data.ptr) % @alignOf(T) != 0) {
+            @panic("safetensors: data not aligned for type. Use getDataAlloc for @embedFile data.");
+        }
+        const aligned_ptr: [*]align(@alignOf(T)) const u8 = @alignCast(byte_data.ptr);
+        return std.mem.bytesAsSlice(T, aligned_ptr[0..byte_data.len]);
+    }
+
+    /// Get raw tensor data, copying to an aligned buffer if necessary.
+    /// Use this when loading from @embedFile which doesn't guarantee alignment.
+    pub fn getDataAlloc(self: SafeTensors, comptime T: type, info: TensorInfo, allocator: std.mem.Allocator) ![]const T {
+        const byte_data = self.data[self.header_size + 8 + info.data_start ..][0..info.byteSize()];
+        const num_elements = byte_data.len / @sizeOf(T);
+
+        // If already aligned, just return a view
+        if (@intFromPtr(byte_data.ptr) % @alignOf(T) == 0) {
+            const aligned_ptr: [*]align(@alignOf(T)) const u8 = @alignCast(byte_data.ptr);
+            return std.mem.bytesAsSlice(T, aligned_ptr[0..byte_data.len]);
+        }
+
+        // Otherwise copy to aligned buffer
+        const aligned_buf = try allocator.alloc(T, num_elements);
+        @memcpy(std.mem.sliceAsBytes(aligned_buf), byte_data);
+        return aligned_buf;
     }
 
     /// Get tensor data as f32 slice (most common case).

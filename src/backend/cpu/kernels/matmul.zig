@@ -15,7 +15,7 @@ const blas = @import("blas.zig");
 pub const use_cblas = blas.has_cblas;
 
 /// Minimum matrix size to use CBLAS (below this, pure Zig is faster due to call overhead)
-const CBLAS_MIN_SIZE: usize = 32;
+const CBLAS_MIN_SIZE: usize = 8;
 
 /// Tile sizes for cache optimization.
 /// These are chosen to fit in L1 cache (~32KB) while maintaining efficiency.
@@ -54,6 +54,28 @@ pub fn matmulTransposeB(
     comptime T: type,
     a: []const T,
     b: []const T, // [N, K] will be treated as [K, N]^T
+    c: []T,
+    m: usize,
+    k: usize,
+    n: usize,
+) void {
+    // Use CBLAS for larger matrices when available (f32/f64 only)
+    if (comptime use_cblas and (T == f32 or T == f64)) {
+        if (m >= CBLAS_MIN_SIZE and n >= CBLAS_MIN_SIZE and k >= CBLAS_MIN_SIZE) {
+            blas.gemm(T, a, b, c, m, k, n, 1.0, 0.0, false, true);
+            return;
+        }
+    }
+
+    // Fall back to pure Zig implementation for small matrices or non-CBLAS targets
+    matmulTransposeBPureZig(T, a, b, c, m, k, n);
+}
+
+/// Pure Zig implementation of matmul with transpose_b (for small matrices or WASM)
+fn matmulTransposeBPureZig(
+    comptime T: type,
+    a: []const T,
+    b: []const T,
     c: []T,
     m: usize,
     k: usize,

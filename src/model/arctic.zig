@@ -86,14 +86,24 @@ pub const ModelWeights = struct {
     config: Config,
     embeddings: EmbeddingWeights,
     layers: []LayerWeights,
+    allocator: std.mem.Allocator,
+    // Track all allocated weight buffers for cleanup
+    allocated_weights: std.ArrayList([]const f32),
 
     /// Load weights from a SafeTensors file.
     /// Handles both "bert." prefixed and non-prefixed weight names.
+    /// Copies weights to aligned memory (required for @embedFile sources).
     pub fn fromSafeTensors(
         allocator: std.mem.Allocator,
         st: safetensors.SafeTensors,
         config: Config,
     ) !ModelWeights {
+        var allocated_weights: std.ArrayList([]const f32) = .empty;
+        errdefer {
+            for (allocated_weights.items) |w| allocator.free(w);
+            allocated_weights.deinit(allocator);
+        }
+
         // Detect if weights have "bert." prefix
         const has_bert_prefix = st.get("bert.embeddings.word_embeddings.weight") != null;
 
@@ -103,115 +113,173 @@ pub const ModelWeights = struct {
 
         // Load embedding weights (handle both gamma/beta and weight/bias naming)
         const emb_weights = if (has_bert_prefix) EmbeddingWeights{
-            .word_embeddings = getWeightData(st, "bert.embeddings.word_embeddings.weight"),
-            .position_embeddings = getWeightData(st, "bert.embeddings.position_embeddings.weight"),
-            .token_type_embeddings = getWeightData(st, "bert.embeddings.token_type_embeddings.weight"),
-            .layer_norm_gamma = getWeightDataAlt(st, "bert.embeddings.LayerNorm.weight", "bert.embeddings.LayerNorm.gamma"),
-            .layer_norm_beta = getWeightDataAlt(st, "bert.embeddings.LayerNorm.bias", "bert.embeddings.LayerNorm.beta"),
+            .word_embeddings = try getWeightDataAlloc(allocator, st, "bert.embeddings.word_embeddings.weight", &allocated_weights),
+            .position_embeddings = try getWeightDataAlloc(allocator, st, "bert.embeddings.position_embeddings.weight", &allocated_weights),
+            .token_type_embeddings = try getWeightDataAlloc(allocator, st, "bert.embeddings.token_type_embeddings.weight", &allocated_weights),
+            .layer_norm_gamma = try getWeightDataAltAlloc(allocator, st, "bert.embeddings.LayerNorm.weight", "bert.embeddings.LayerNorm.gamma", &allocated_weights),
+            .layer_norm_beta = try getWeightDataAltAlloc(allocator, st, "bert.embeddings.LayerNorm.bias", "bert.embeddings.LayerNorm.beta", &allocated_weights),
         } else EmbeddingWeights{
-            .word_embeddings = getWeightData(st, "embeddings.word_embeddings.weight"),
-            .position_embeddings = getWeightData(st, "embeddings.position_embeddings.weight"),
-            .token_type_embeddings = getWeightData(st, "embeddings.token_type_embeddings.weight"),
-            .layer_norm_gamma = getWeightDataAlt(st, "embeddings.LayerNorm.weight", "embeddings.LayerNorm.gamma"),
-            .layer_norm_beta = getWeightDataAlt(st, "embeddings.LayerNorm.bias", "embeddings.LayerNorm.beta"),
+            .word_embeddings = try getWeightDataAlloc(allocator, st, "embeddings.word_embeddings.weight", &allocated_weights),
+            .position_embeddings = try getWeightDataAlloc(allocator, st, "embeddings.position_embeddings.weight", &allocated_weights),
+            .token_type_embeddings = try getWeightDataAlloc(allocator, st, "embeddings.token_type_embeddings.weight", &allocated_weights),
+            .layer_norm_gamma = try getWeightDataAltAlloc(allocator, st, "embeddings.LayerNorm.weight", "embeddings.LayerNorm.gamma", &allocated_weights),
+            .layer_norm_beta = try getWeightDataAltAlloc(allocator, st, "embeddings.LayerNorm.bias", "embeddings.LayerNorm.beta", &allocated_weights),
         };
 
         // Load each transformer layer
         for (0..config.num_hidden_layers) |i| {
-            layers[i] = loadLayerWeights(st, i, has_bert_prefix);
+            layers[i] = try loadLayerWeightsAlloc(allocator, st, i, has_bert_prefix, &allocated_weights);
         }
 
         return .{
             .config = config,
             .embeddings = emb_weights,
             .layers = layers,
+            .allocator = allocator,
+            .allocated_weights = allocated_weights,
         };
     }
 
     pub fn deinit(self: *ModelWeights, allocator: std.mem.Allocator) void {
-        allocator.free(self.layers);
+        _ = allocator; // Use stored allocator
+        // Free all allocated weight buffers
+        for (self.allocated_weights.items) |w| self.allocator.free(w);
+        self.allocated_weights.deinit(self.allocator);
+        self.allocator.free(self.layers);
     }
 };
 
-/// Helper to get f32 weight data from SafeTensors by name.
-fn getWeightData(st: safetensors.SafeTensors, name: []const u8) []const f32 {
+/// Helper to get f32 weight data from SafeTensors by name (allocates aligned copy).
+fn getWeightDataAlloc(
+    allocator: std.mem.Allocator,
+    st: safetensors.SafeTensors,
+    name: []const u8,
+    allocated_weights: *std.ArrayList([]const f32),
+) ![]const f32 {
     const info = st.get(name) orelse {
         std.log.err("Missing weight: {s}", .{name});
-        @panic("Missing required weight");
+        return error.MissingWeight;
     };
     if (info.dtype != .F32) {
         std.log.err("Weight {s} has wrong dtype, expected F32", .{name});
-        @panic("Wrong weight dtype");
+        return error.WrongDtype;
     }
-    return st.getData(f32, info);
+    const data = try st.getDataAlloc(f32, info, allocator);
+    // Track allocation if a copy was made (check if it's a new allocation)
+    const byte_data = st.data[st.header_size + 8 + info.data_start ..][0..info.byteSize()];
+    if (@intFromPtr(data.ptr) != @intFromPtr(byte_data.ptr)) {
+        try allocated_weights.append(allocator, data);
+    }
+    return data;
 }
 
 /// Helper to try primary name, fall back to alternate (for weight/gamma, bias/beta).
-fn getWeightDataAlt(st: safetensors.SafeTensors, primary: []const u8, alternate: []const u8) []const f32 {
-    if (st.get(primary)) |info| {
-        if (info.dtype != .F32) @panic("Wrong weight dtype");
-        return st.getData(f32, info);
+fn getWeightDataAltAlloc(
+    allocator: std.mem.Allocator,
+    st: safetensors.SafeTensors,
+    primary: []const u8,
+    alternate: []const u8,
+    allocated_weights: *std.ArrayList([]const f32),
+) ![]const f32 {
+    if (st.get(primary)) |_| {
+        return getWeightDataAlloc(allocator, st, primary, allocated_weights);
     }
-    return getWeightData(st, alternate);
+    return getWeightDataAlloc(allocator, st, alternate, allocated_weights);
 }
 
-/// Load attention weights for a specific layer.
-fn loadAttentionWeights(st: safetensors.SafeTensors, layer_idx: usize, has_bert_prefix: bool) AttentionWeights {
+/// Load attention weights for a specific layer (allocating version).
+fn loadAttentionWeightsAlloc(
+    allocator: std.mem.Allocator,
+    st: safetensors.SafeTensors,
+    layer_idx: usize,
+    has_bert_prefix: bool,
+    allocated_weights: *std.ArrayList([]const f32),
+) !AttentionWeights {
     var buf: [128]u8 = undefined;
     var alt_buf: [128]u8 = undefined;
 
     const base = if (has_bert_prefix) "bert.encoder.layer" else "encoder.layer";
 
     return .{
-        .query_weight = getLayerWeightFmt(st, &buf, base, layer_idx, "attention.self.query.weight"),
-        .query_bias = getLayerWeightFmt(st, &buf, base, layer_idx, "attention.self.query.bias"),
-        .key_weight = getLayerWeightFmt(st, &buf, base, layer_idx, "attention.self.key.weight"),
-        .key_bias = getLayerWeightFmt(st, &buf, base, layer_idx, "attention.self.key.bias"),
-        .value_weight = getLayerWeightFmt(st, &buf, base, layer_idx, "attention.self.value.weight"),
-        .value_bias = getLayerWeightFmt(st, &buf, base, layer_idx, "attention.self.value.bias"),
-        .output_weight = getLayerWeightFmt(st, &buf, base, layer_idx, "attention.output.dense.weight"),
-        .output_bias = getLayerWeightFmt(st, &buf, base, layer_idx, "attention.output.dense.bias"),
-        .output_ln_gamma = getLayerWeightAlt(st, &buf, &alt_buf, base, layer_idx, "attention.output.LayerNorm.weight", "attention.output.LayerNorm.gamma"),
-        .output_ln_beta = getLayerWeightAlt(st, &buf, &alt_buf, base, layer_idx, "attention.output.LayerNorm.bias", "attention.output.LayerNorm.beta"),
+        .query_weight = try getLayerWeightFmtAlloc(allocator, st, &buf, base, layer_idx, "attention.self.query.weight", allocated_weights),
+        .query_bias = try getLayerWeightFmtAlloc(allocator, st, &buf, base, layer_idx, "attention.self.query.bias", allocated_weights),
+        .key_weight = try getLayerWeightFmtAlloc(allocator, st, &buf, base, layer_idx, "attention.self.key.weight", allocated_weights),
+        .key_bias = try getLayerWeightFmtAlloc(allocator, st, &buf, base, layer_idx, "attention.self.key.bias", allocated_weights),
+        .value_weight = try getLayerWeightFmtAlloc(allocator, st, &buf, base, layer_idx, "attention.self.value.weight", allocated_weights),
+        .value_bias = try getLayerWeightFmtAlloc(allocator, st, &buf, base, layer_idx, "attention.self.value.bias", allocated_weights),
+        .output_weight = try getLayerWeightFmtAlloc(allocator, st, &buf, base, layer_idx, "attention.output.dense.weight", allocated_weights),
+        .output_bias = try getLayerWeightFmtAlloc(allocator, st, &buf, base, layer_idx, "attention.output.dense.bias", allocated_weights),
+        .output_ln_gamma = try getLayerWeightAltAlloc(allocator, st, &buf, &alt_buf, base, layer_idx, "attention.output.LayerNorm.weight", "attention.output.LayerNorm.gamma", allocated_weights),
+        .output_ln_beta = try getLayerWeightAltAlloc(allocator, st, &buf, &alt_buf, base, layer_idx, "attention.output.LayerNorm.bias", "attention.output.LayerNorm.beta", allocated_weights),
     };
 }
 
-/// Load feed-forward weights for a specific layer.
-fn loadFeedForwardWeights(st: safetensors.SafeTensors, layer_idx: usize, has_bert_prefix: bool) FeedForwardWeights {
+/// Load feed-forward weights for a specific layer (allocating version).
+fn loadFeedForwardWeightsAlloc(
+    allocator: std.mem.Allocator,
+    st: safetensors.SafeTensors,
+    layer_idx: usize,
+    has_bert_prefix: bool,
+    allocated_weights: *std.ArrayList([]const f32),
+) !FeedForwardWeights {
     var buf: [128]u8 = undefined;
     var alt_buf: [128]u8 = undefined;
 
     const base = if (has_bert_prefix) "bert.encoder.layer" else "encoder.layer";
 
     return .{
-        .intermediate_weight = getLayerWeightFmt(st, &buf, base, layer_idx, "intermediate.dense.weight"),
-        .intermediate_bias = getLayerWeightFmt(st, &buf, base, layer_idx, "intermediate.dense.bias"),
-        .output_weight = getLayerWeightFmt(st, &buf, base, layer_idx, "output.dense.weight"),
-        .output_bias = getLayerWeightFmt(st, &buf, base, layer_idx, "output.dense.bias"),
-        .output_ln_gamma = getLayerWeightAlt(st, &buf, &alt_buf, base, layer_idx, "output.LayerNorm.weight", "output.LayerNorm.gamma"),
-        .output_ln_beta = getLayerWeightAlt(st, &buf, &alt_buf, base, layer_idx, "output.LayerNorm.bias", "output.LayerNorm.beta"),
+        .intermediate_weight = try getLayerWeightFmtAlloc(allocator, st, &buf, base, layer_idx, "intermediate.dense.weight", allocated_weights),
+        .intermediate_bias = try getLayerWeightFmtAlloc(allocator, st, &buf, base, layer_idx, "intermediate.dense.bias", allocated_weights),
+        .output_weight = try getLayerWeightFmtAlloc(allocator, st, &buf, base, layer_idx, "output.dense.weight", allocated_weights),
+        .output_bias = try getLayerWeightFmtAlloc(allocator, st, &buf, base, layer_idx, "output.dense.bias", allocated_weights),
+        .output_ln_gamma = try getLayerWeightAltAlloc(allocator, st, &buf, &alt_buf, base, layer_idx, "output.LayerNorm.weight", "output.LayerNorm.gamma", allocated_weights),
+        .output_ln_beta = try getLayerWeightAltAlloc(allocator, st, &buf, &alt_buf, base, layer_idx, "output.LayerNorm.bias", "output.LayerNorm.beta", allocated_weights),
     };
 }
 
-/// Load all weights for a specific layer.
-fn loadLayerWeights(st: safetensors.SafeTensors, layer_idx: usize, has_bert_prefix: bool) LayerWeights {
+/// Load all weights for a specific layer (allocating version).
+fn loadLayerWeightsAlloc(
+    allocator: std.mem.Allocator,
+    st: safetensors.SafeTensors,
+    layer_idx: usize,
+    has_bert_prefix: bool,
+    allocated_weights: *std.ArrayList([]const f32),
+) !LayerWeights {
     return .{
-        .attention = loadAttentionWeights(st, layer_idx, has_bert_prefix),
-        .ffn = loadFeedForwardWeights(st, layer_idx, has_bert_prefix),
+        .attention = try loadAttentionWeightsAlloc(allocator, st, layer_idx, has_bert_prefix, allocated_weights),
+        .ffn = try loadFeedForwardWeightsAlloc(allocator, st, layer_idx, has_bert_prefix, allocated_weights),
     };
 }
 
-/// Get a weight with layer-prefixed name.
-fn getLayerWeightFmt(st: safetensors.SafeTensors, buf: *[128]u8, base: []const u8, layer_idx: usize, suffix: []const u8) []const f32 {
+/// Get a weight with layer-prefixed name (allocating version).
+fn getLayerWeightFmtAlloc(
+    allocator: std.mem.Allocator,
+    st: safetensors.SafeTensors,
+    buf: *[128]u8,
+    base: []const u8,
+    layer_idx: usize,
+    suffix: []const u8,
+    allocated_weights: *std.ArrayList([]const f32),
+) ![]const f32 {
     const name = std.fmt.bufPrint(buf, "{s}.{d}.{s}", .{ base, layer_idx, suffix }) catch unreachable;
-    return getWeightData(st, name);
+    return getWeightDataAlloc(allocator, st, name, allocated_weights);
 }
 
-/// Get a weight with fallback for gamma/beta naming.
-fn getLayerWeightAlt(st: safetensors.SafeTensors, buf: *[128]u8, alt_buf: *[128]u8, base: []const u8, layer_idx: usize, primary_suffix: []const u8, alt_suffix: []const u8) []const f32 {
+/// Get a weight with fallback for gamma/beta naming (allocating version).
+fn getLayerWeightAltAlloc(
+    allocator: std.mem.Allocator,
+    st: safetensors.SafeTensors,
+    buf: *[128]u8,
+    alt_buf: *[128]u8,
+    base: []const u8,
+    layer_idx: usize,
+    primary_suffix: []const u8,
+    alt_suffix: []const u8,
+    allocated_weights: *std.ArrayList([]const f32),
+) ![]const f32 {
     const primary = std.fmt.bufPrint(buf, "{s}.{d}.{s}", .{ base, layer_idx, primary_suffix }) catch unreachable;
     const alternate = std.fmt.bufPrint(alt_buf, "{s}.{d}.{s}", .{ base, layer_idx, alt_suffix }) catch unreachable;
-    return getWeightDataAlt(st, primary, alternate);
+    return getWeightDataAltAlloc(allocator, st, primary, alternate, allocated_weights);
 }
 
 // ============================================================================
@@ -231,6 +299,12 @@ pub const InferenceContext = struct {
     ffn_intermediate: []f32, // [seq_len, intermediate_size]
     tmp: []f32, // Scratch buffer for encoder layer chaining
 
+    // Per-head attention scratch buffers for optimized matmul
+    q_head: []f32, // [seq_len, head_dim] - contiguous Q for one head
+    k_head: []f32, // [seq_len, head_dim] - contiguous K for one head
+    v_head: []f32, // [seq_len, head_dim] - contiguous V for one head
+    attn_out_head: []f32, // [seq_len, head_dim] - contiguous output for one head
+
     // Additional buffers for full forward pass
     encoder_input: []f32, // Input to encoder
     encoder_output: []f32, // Output from encoder
@@ -249,6 +323,7 @@ pub const InferenceContext = struct {
         const h = config.hidden_size;
         const inter = config.intermediate_size;
         const heads = config.num_attention_heads;
+        const head_dim = h / heads;
 
         return .{
             .allocator = allocator,
@@ -259,6 +334,10 @@ pub const InferenceContext = struct {
             .attn_out = try allocator.alloc(f32, max_seq_len * h),
             .ffn_intermediate = try allocator.alloc(f32, max_seq_len * inter),
             .tmp = try allocator.alloc(f32, max_seq_len * h),
+            .q_head = try allocator.alloc(f32, max_seq_len * head_dim),
+            .k_head = try allocator.alloc(f32, max_seq_len * head_dim),
+            .v_head = try allocator.alloc(f32, max_seq_len * head_dim),
+            .attn_out_head = try allocator.alloc(f32, max_seq_len * head_dim),
             .encoder_input = try allocator.alloc(f32, max_seq_len * h),
             .encoder_output = try allocator.alloc(f32, max_seq_len * h),
             .layer_input = try allocator.alloc(f32, max_seq_len * h),
@@ -274,6 +353,10 @@ pub const InferenceContext = struct {
         self.allocator.free(self.attn_out);
         self.allocator.free(self.ffn_intermediate);
         self.allocator.free(self.tmp);
+        self.allocator.free(self.q_head);
+        self.allocator.free(self.k_head);
+        self.allocator.free(self.v_head);
+        self.allocator.free(self.attn_out_head);
         self.allocator.free(self.encoder_input);
         self.allocator.free(self.encoder_output);
         self.allocator.free(self.layer_input);
@@ -395,23 +478,26 @@ pub fn selfAttention(
         const head_offset = head * head_dim;
         const scores_offset = head * seq_len * seq_len;
 
-        // Compute attention scores: Q_h @ K_h^T / sqrt(d_k)
-        for (0..seq_len) |qi| {
-            for (0..seq_len) |ki| {
-                var dot: f32 = 0;
-                for (0..head_dim) |d| {
-                    const q_idx = qi * h + head_offset + d;
-                    const k_idx = ki * h + head_offset + d;
-                    dot += q[q_idx] * k[k_idx];
-                }
-                ctx.attn_scores[scores_offset + qi * seq_len + ki] = dot * scale;
-            }
+        // Extract Q_h, K_h, V_h to contiguous buffers for matmul
+        for (0..seq_len) |s| {
+            @memcpy(ctx.q_head[s * head_dim ..][0..head_dim], q[s * h + head_offset ..][0..head_dim]);
+            @memcpy(ctx.k_head[s * head_dim ..][0..head_dim], k[s * h + head_offset ..][0..head_dim]);
+            @memcpy(ctx.v_head[s * head_dim ..][0..head_dim], v[s * h + head_offset ..][0..head_dim]);
+        }
+
+        // Compute attention scores: Q_h @ K_h^T using matmul
+        // [seq_len, head_dim] @ [seq_len, head_dim]^T = [seq_len, seq_len]
+        const scores = ctx.attn_scores[scores_offset..][0 .. seq_len * seq_len];
+        kernels.matmul.matmulTransposeB(f32, ctx.q_head[0 .. seq_len * head_dim], ctx.k_head[0 .. seq_len * head_dim], scores, seq_len, head_dim, seq_len);
+
+        // Scale scores
+        for (scores) |*s| {
+            s.* *= scale;
         }
 
         // Softmax over last dimension
         for (0..seq_len) |qi| {
-            const row_start = scores_offset + qi * seq_len;
-            const row = ctx.attn_scores[row_start..][0..seq_len];
+            const row = scores[qi * seq_len ..][0..seq_len];
 
             // Find max for numerical stability
             var max_val: f32 = row[0];
@@ -432,17 +518,13 @@ pub fn selfAttention(
             }
         }
 
-        // Apply attention: scores @ V_h -> attn_out
-        for (0..seq_len) |qi| {
-            for (0..head_dim) |d| {
-                var sum: f32 = 0;
-                for (0..seq_len) |vi| {
-                    const score = ctx.attn_scores[scores_offset + qi * seq_len + vi];
-                    const v_idx = vi * h + head_offset + d;
-                    sum += score * v[v_idx];
-                }
-                ctx.attn_out[qi * h + head_offset + d] = sum;
-            }
+        // Apply attention: scores @ V_h using matmul
+        // [seq_len, seq_len] @ [seq_len, head_dim] = [seq_len, head_dim]
+        kernels.matmul.matmulTiled(f32, scores, ctx.v_head[0 .. seq_len * head_dim], ctx.attn_out_head[0 .. seq_len * head_dim], seq_len, seq_len, head_dim);
+
+        // Copy attn_out_head back to interleaved attn_out
+        for (0..seq_len) |s| {
+            @memcpy(ctx.attn_out[s * h + head_offset ..][0..head_dim], ctx.attn_out_head[s * head_dim ..][0..head_dim]);
         }
     }
 
@@ -701,18 +783,17 @@ pub fn forwardBatchParallel(
     if (batch_size == 0) return;
 
     const h = weights.config.hidden_size;
-    const num_contexts = ctx_pool.contexts.len;
 
-    // Compute items per worker to determine context assignment
-    const items_per_worker = (batch_size + num_contexts - 1) / num_contexts;
+    // Atomic counter to assign unique context indices to each work batch
+    var ctx_counter = std.atomic.Value(u32).init(0);
 
     const Context = struct {
         outputs: []f32,
         token_ids_batch: []const []const u32,
         weights: ModelWeights,
         ctx_pool: *BatchContextPool,
+        ctx_counter: *std.atomic.Value(u32),
         h: usize,
-        items_per_worker: usize,
     };
 
     const ctx = Context{
@@ -720,16 +801,20 @@ pub fn forwardBatchParallel(
         .token_ids_batch = token_ids_batch,
         .weights = weights,
         .ctx_pool = ctx_pool,
+        .ctx_counter = &ctx_counter,
         .h = h,
-        .items_per_worker = items_per_worker,
     };
 
     pool.parallelForBatch(batch_size, ctx, struct {
         fn work(c: Context, start: usize, end: usize) void {
-            // Compute worker index from start position
-            const worker_idx = start / c.items_per_worker;
-            const ctx_idx = worker_idx % c.ctx_pool.contexts.len;
+            // Get unique context for this work batch
+            const ctx_idx = c.ctx_counter.fetchAdd(1, .monotonic) % c.ctx_pool.contexts.len;
             const local_ctx = &c.ctx_pool.contexts[ctx_idx];
+
+            // Disable inner parallelism - we're already parallel at batch level
+            const saved_pool = local_ctx.pool;
+            local_ctx.pool = null;
+            defer local_ctx.pool = saved_pool;
 
             for (start..end) |batch_idx| {
                 forward(

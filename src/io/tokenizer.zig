@@ -46,6 +46,11 @@ pub const Tokenizer = struct {
             total_read += n;
         }
 
+        try self.loadVocabFromBytes(data);
+    }
+
+    /// Load vocabulary from bytes (one token per line).
+    pub fn loadVocabFromBytes(self: *Tokenizer, data: []const u8) !void {
         var line_idx: u32 = 0;
         var lines = std.mem.splitScalar(u8, data, '\n');
         while (lines.next()) |line| {
