@@ -27,8 +27,7 @@ pub fn build(b: *std.Build) void {
     // Optional system BLAS with translate-c for high-performance BLAS operations.
     // Disabled by default so cross-compiles (musl, Windows, etc.) don't require cblas headers/libs.
     const cblas_mod: ?*std.Build.Module = if (enable_blas) blk: {
-        const translate_c_dep = b.dependency("translate_c", .{});
-        break :blk blas_build.addBlas(b, translate_c_dep, target, optimize);
+        break :blk blas_build.addBlas(b, target, optimize);
     } else null;
 
     // This creates a module, which represents a collection of source files alongside
