@@ -44,6 +44,24 @@ pub const DType = enum {
         return map.get(s);
     }
 
+    pub fn toString(self: DType) []const u8 {
+        return switch (self) {
+            .F16 => "F16",
+            .BF16 => "BF16",
+            .F32 => "F32",
+            .F64 => "F64",
+            .I8 => "I8",
+            .I16 => "I16",
+            .I32 => "I32",
+            .I64 => "I64",
+            .U8 => "U8",
+            .U16 => "U16",
+            .U32 => "U32",
+            .U64 => "U64",
+            .BOOL => "BOOL",
+        };
+    }
+
     pub fn byteSize(self: DType) usize {
         return switch (self) {
             .F16, .BF16, .I16, .U16 => 2,
@@ -274,6 +292,118 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !struct { st: SafeTe
     const st = try parse(allocator, data);
 
     return .{ .st = st, .data = data };
+}
+
+pub const TensorToWrite = struct {
+    name: []const u8,
+    dtype: DType,
+    shape: []const usize,
+    data: []const u8,
+};
+
+fn writeJsonString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    try out.append(allocator, '"');
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => {
+                if (ch < 0x20) {
+                    var buf: [6]u8 = undefined;
+                    const esc = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{@as(u16, ch)}) catch unreachable;
+                    try out.appendSlice(allocator, esc);
+                } else {
+                    try out.append(allocator, ch);
+                }
+            },
+        }
+    }
+    try out.append(allocator, '"');
+}
+
+fn writeJsonUsizeArray(out: *std.ArrayList(u8), allocator: std.mem.Allocator, values: []const usize) !void {
+    try out.append(allocator, '[');
+    for (values, 0..) |v, i| {
+        if (i != 0) try out.append(allocator, ',');
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{}", .{v}) catch unreachable;
+        try out.appendSlice(allocator, s);
+    }
+    try out.append(allocator, ']');
+}
+
+fn writeJsonU64Pair(out: *std.ArrayList(u8), allocator: std.mem.Allocator, a: u64, b: u64) !void {
+    try out.append(allocator, '[');
+    var buf_a: [32]u8 = undefined;
+    const s_a = std.fmt.bufPrint(&buf_a, "{}", .{a}) catch unreachable;
+    try out.appendSlice(allocator, s_a);
+    try out.append(allocator, ',');
+    var buf_b: [32]u8 = undefined;
+    const s_b = std.fmt.bufPrint(&buf_b, "{}", .{b}) catch unreachable;
+    try out.appendSlice(allocator, s_b);
+    try out.append(allocator, ']');
+}
+
+pub fn writeFile(allocator: std.mem.Allocator, path: []const u8, tensors: []const TensorToWrite) !void {
+    var header: std.ArrayList(u8) = .empty;
+    defer header.deinit(allocator);
+
+    var data_offset: u64 = 0;
+
+    try header.append(allocator, '{');
+    for (tensors, 0..) |t, i| {
+        var expected_numel: usize = 1;
+        for (t.shape) |d| expected_numel *= d;
+
+        const expected_bytes: usize = expected_numel * t.dtype.byteSize();
+        if (t.data.len != expected_bytes) return error.DataSizeMismatch;
+
+        const start: u64 = data_offset;
+        const end: u64 = start + @as(u64, @intCast(t.data.len));
+        data_offset = end;
+
+        if (i != 0) try header.append(allocator, ',');
+
+        try writeJsonString(&header, allocator, t.name);
+        try header.append(allocator, ':');
+        try header.append(allocator, '{');
+
+        try writeJsonString(&header, allocator, "dtype");
+        try header.append(allocator, ':');
+        try writeJsonString(&header, allocator, t.dtype.toString());
+        try header.append(allocator, ',');
+
+        try writeJsonString(&header, allocator, "shape");
+        try header.append(allocator, ':');
+        try writeJsonUsizeArray(&header, allocator, t.shape);
+        try header.append(allocator, ',');
+
+        try writeJsonString(&header, allocator, "data_offsets");
+        try header.append(allocator, ':');
+        try writeJsonU64Pair(&header, allocator, start, end);
+
+        try header.append(allocator, '}');
+    }
+    try header.append(allocator, '}');
+
+    while (header.items.len % 8 != 0) {
+        try header.append(allocator, ' ');
+    }
+
+    const file = try std.fs.cwd().createFile(path, .{});
+    defer file.close();
+
+    var header_size_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, header_size_bytes[0..8], @intCast(header.items.len), .little);
+    try file.writeAll(&header_size_bytes);
+    try file.writeAll(header.items);
+
+    for (tensors) |t| {
+        try file.writeAll(t.data);
+    }
 }
 
 // ============================================================================
