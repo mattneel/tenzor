@@ -1,4 +1,5 @@
 const std = @import("std");
+const blas_build = @import("libs/blas/build.zig");
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -21,6 +22,10 @@ pub fn build(b: *std.Build) void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
+    // System BLAS with translate-c for high-performance BLAS operations
+    const translate_c_dep = b.dependency("translate_c", .{});
+    const cblas_mod = blas_build.addBlas(b, translate_c_dep, target, optimize);
+
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
     // Zig modules are the preferred way of making Zig code available to consumers.
@@ -40,6 +45,11 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
+
+    // Add CBLAS module for high-performance BLAS access
+    mod.addImport("cblas", cblas_mod);
+    // Link OpenBLAS directly (provides CBLAS interface)
+    mod.linkSystemLibrary("openblas", .{ .preferred_link_mode = .dynamic });
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -182,9 +192,12 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "tenzor", .module = mod },
                 .{ .name = "ziterion", .module = ziterion.module("ziterion") },
+                .{ .name = "cblas", .module = cblas_mod },
             },
         }),
     });
+    // Also link OpenBLAS for benchmark
+    bench_exe.root_module.linkSystemLibrary("openblas", .{ .preferred_link_mode = .dynamic });
 
     const bench_step = b.step("bench", "Run performance benchmarks");
     const bench_run = b.addRunArtifact(bench_exe);

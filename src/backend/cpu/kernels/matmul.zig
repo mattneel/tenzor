@@ -1,13 +1,21 @@
 //! Matrix multiplication CPU kernel with tiling optimization.
 //!
 //! Implements efficient matrix multiplication with cache-aware tiling
-//! and SIMD vectorization where possible.
+//! and SIMD vectorization where possible. When CBLAS is available
+//! (native builds with system BLAS), delegates to optimized BLAS routines.
 //!
 //! Parallel versions available for multi-threaded execution.
 
 const std = @import("std");
 const simd = @import("../simd.zig");
 const threading = @import("../threading.zig");
+const blas = @import("blas.zig");
+
+/// Whether to use CBLAS for matrix operations (when available and beneficial)
+pub const use_cblas = blas.has_cblas;
+
+/// Minimum matrix size to use CBLAS (below this, pure Zig is faster due to call overhead)
+const CBLAS_MIN_SIZE: usize = 32;
 
 /// Tile sizes for cache optimization.
 /// These are chosen to fit in L1 cache (~32KB) while maintaining efficiency.
@@ -67,8 +75,31 @@ pub fn matmulTransposeB(
 }
 
 /// Tiled matrix multiplication: C = A @ B
-/// Uses blocking for cache efficiency.
+/// Uses blocking for cache efficiency. Delegates to CBLAS for larger matrices
+/// when available on native targets.
 pub fn matmulTiled(
+    comptime T: type,
+    a: []const T,
+    b: []const T,
+    c: []T,
+    m: usize,
+    k: usize,
+    n: usize,
+) void {
+    // Use CBLAS for larger matrices when available (f32/f64 only)
+    if (comptime use_cblas and (T == f32 or T == f64)) {
+        if (m >= CBLAS_MIN_SIZE and n >= CBLAS_MIN_SIZE and k >= CBLAS_MIN_SIZE) {
+            blas.matmul(T, a, b, c, m, k, n);
+            return;
+        }
+    }
+
+    // Fall back to pure Zig implementation for small matrices or non-CBLAS targets
+    matmulTiledPureZig(T, a, b, c, m, k, n);
+}
+
+/// Pure Zig tiled matrix multiplication (no CBLAS dependency).
+fn matmulTiledPureZig(
     comptime T: type,
     a: []const T,
     b: []const T,
@@ -188,6 +219,26 @@ pub fn vecMatmul(
     k: usize,
     n: usize,
 ) void {
+    // Use CBLAS for larger vectors when available
+    if (comptime use_cblas and (T == f32 or T == f64)) {
+        if (k >= CBLAS_MIN_SIZE and n >= CBLAS_MIN_SIZE) {
+            blas.vecMatmul(T, x, a, y, k, n);
+            return;
+        }
+    }
+
+    vecMatmulPureZig(T, x, a, y, k, n);
+}
+
+/// Pure Zig vector-matrix multiplication.
+fn vecMatmulPureZig(
+    comptime T: type,
+    x: []const T,
+    a: []const T,
+    y: []T,
+    k: usize,
+    n: usize,
+) void {
     @memset(y, 0);
 
     for (0..k) |kk| {
@@ -224,6 +275,26 @@ pub fn matVecmul(
     m: usize,
     k: usize,
 ) void {
+    // Use CBLAS for larger matrices when available
+    if (comptime use_cblas and (T == f32 or T == f64)) {
+        if (m >= CBLAS_MIN_SIZE and k >= CBLAS_MIN_SIZE) {
+            blas.matVecmul(T, a, x, y, m, k);
+            return;
+        }
+    }
+
+    matVecmulPureZig(T, a, x, y, m, k);
+}
+
+/// Pure Zig matrix-vector multiplication.
+fn matVecmulPureZig(
+    comptime T: type,
+    a: []const T,
+    x: []const T,
+    y: []T,
+    m: usize,
+    k: usize,
+) void {
     for (0..m) |i| {
         var sum: T = 0;
 
@@ -250,6 +321,18 @@ pub fn matVecmul(
 pub fn dotProduct(comptime T: type, a: []const T, b: []const T) T {
     std.debug.assert(a.len == b.len);
 
+    // Use CBLAS for larger vectors when available
+    if (comptime use_cblas and (T == f32 or T == f64)) {
+        if (a.len >= CBLAS_MIN_SIZE) {
+            return blas.dot(T, a, b);
+        }
+    }
+
+    return dotProductPureZig(T, a, b);
+}
+
+/// Pure Zig dot product.
+fn dotProductPureZig(comptime T: type, a: []const T, b: []const T) T {
     var sum: T = 0;
     var i: usize = 0;
     const vec_len = simd.suggestVectorLength(T);

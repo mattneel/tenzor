@@ -40,6 +40,10 @@
             .url = "git+https://github.com/mattneel/ziterion#2eba9bb66b7c2a8ffddef17c002c7fe2d3417f16",
             .hash = "ziterion-0.0.0-_wU4-EtIBADSLUOeSpGz6NA-W6ag698OkDvT40fRUCo9",
         },
+        .translate_c = .{
+            .url = "git+https://github.com/ziglang/translate-c#683a7da2af569e76e1dcf4b1bfaeb475fd4daaf9",
+            .hash = "translate_c-0.0.0-Q_BUWsauBgDTOOw7VrbuT5gkfPrXhh8WCZng6qfoETNC",
+        },
     },
     .paths = .{
         "build.zig",
