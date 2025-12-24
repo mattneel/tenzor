@@ -22,9 +22,14 @@ pub fn build(b: *std.Build) void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
-    // System BLAS with translate-c for high-performance BLAS operations
-    const translate_c_dep = b.dependency("translate_c", .{});
-    const cblas_mod = blas_build.addBlas(b, translate_c_dep, target, optimize);
+    const enable_blas = b.option(bool, "blas", "Enable system BLAS (OpenBLAS) acceleration") orelse false;
+
+    // Optional system BLAS with translate-c for high-performance BLAS operations.
+    // Disabled by default so cross-compiles (musl, Windows, etc.) don't require cblas headers/libs.
+    const cblas_mod: ?*std.Build.Module = if (enable_blas) blk: {
+        const translate_c_dep = b.dependency("translate_c", .{});
+        break :blk blas_build.addBlas(b, translate_c_dep, target, optimize);
+    } else null;
 
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -46,10 +51,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    // Add CBLAS module for high-performance BLAS access
-    mod.addImport("cblas", cblas_mod);
-    // Link OpenBLAS directly (provides CBLAS interface)
-    mod.linkSystemLibrary("openblas", .{ .preferred_link_mode = .dynamic });
+    const tenzor_options = b.addOptions();
+    tenzor_options.addOption(bool, "enable_blas", enable_blas);
+    mod.addOptions("tenzor_options", tenzor_options);
+
+    if (cblas_mod) |cblas| {
+        // Add CBLAS module for high-performance BLAS access
+        mod.addImport("cblas", cblas);
+        // Link OpenBLAS directly (provides CBLAS interface)
+        mod.linkSystemLibrary("openblas", .{ .preferred_link_mode = .dynamic });
+    }
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -192,12 +203,9 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "tenzor", .module = mod },
                 .{ .name = "ziterion", .module = ziterion.module("ziterion") },
-                .{ .name = "cblas", .module = cblas_mod },
             },
         }),
     });
-    // Also link OpenBLAS for benchmark
-    bench_exe.root_module.linkSystemLibrary("openblas", .{ .preferred_link_mode = .dynamic });
 
     const bench_step = b.step("bench", "Run performance benchmarks");
     const bench_run = b.addRunArtifact(bench_exe);

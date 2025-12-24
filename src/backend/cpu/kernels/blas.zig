@@ -5,9 +5,10 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const options = @import("tenzor_options");
 
-// CBLAS is only available on native targets, not WASM
-pub const has_cblas = builtin.os.tag != .freestanding and builtin.cpu.arch != .wasm32;
+// CBLAS is optional; when disabled we fall back to pure Zig kernels.
+pub const has_cblas = options.enable_blas and builtin.os.tag != .freestanding and builtin.cpu.arch != .wasm32;
 
 // Import CBLAS bindings when available
 const cblas = if (has_cblas) @import("cblas") else struct {};
