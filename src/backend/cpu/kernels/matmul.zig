@@ -11,8 +11,8 @@ const simd = @import("../simd.zig");
 const threading = @import("../threading.zig");
 const blas = @import("blas.zig");
 
-/// Whether to use CBLAS for matrix operations (when available and beneficial)
-pub const use_cblas = blas.has_cblas;
+/// Whether this build can attempt runtime CBLAS acceleration.
+pub const can_try_cblas = blas.can_try_cblas;
 
 /// Minimum matrix size to use CBLAS (below this, pure Zig is faster due to call overhead)
 const CBLAS_MIN_SIZE: usize = 8;
@@ -60,10 +60,9 @@ pub fn matmulTransposeB(
     n: usize,
 ) void {
     // Use CBLAS for larger matrices when available (f32/f64 only)
-    if (comptime use_cblas and (T == f32 or T == f64)) {
+    if (comptime can_try_cblas and (T == f32 or T == f64)) {
         if (m >= CBLAS_MIN_SIZE and n >= CBLAS_MIN_SIZE and k >= CBLAS_MIN_SIZE) {
-            blas.gemm(T, a, b, c, m, k, n, 1.0, 0.0, false, true);
-            return;
+            if (blas.gemm(T, a, b, c, m, k, n, 1.0, 0.0, false, true)) return;
         }
     }
 
@@ -109,10 +108,9 @@ pub fn matmulTiled(
     n: usize,
 ) void {
     // Use CBLAS for larger matrices when available (f32/f64 only)
-    if (comptime use_cblas and (T == f32 or T == f64)) {
+    if (comptime can_try_cblas and (T == f32 or T == f64)) {
         if (m >= CBLAS_MIN_SIZE and n >= CBLAS_MIN_SIZE and k >= CBLAS_MIN_SIZE) {
-            blas.matmul(T, a, b, c, m, k, n);
-            return;
+            if (blas.matmul(T, a, b, c, m, k, n)) return;
         }
     }
 
@@ -242,10 +240,9 @@ pub fn vecMatmul(
     n: usize,
 ) void {
     // Use CBLAS for larger vectors when available
-    if (comptime use_cblas and (T == f32 or T == f64)) {
+    if (comptime can_try_cblas and (T == f32 or T == f64)) {
         if (k >= CBLAS_MIN_SIZE and n >= CBLAS_MIN_SIZE) {
-            blas.vecMatmul(T, x, a, y, k, n);
-            return;
+            if (blas.vecMatmul(T, x, a, y, k, n)) return;
         }
     }
 
@@ -298,10 +295,9 @@ pub fn matVecmul(
     k: usize,
 ) void {
     // Use CBLAS for larger matrices when available
-    if (comptime use_cblas and (T == f32 or T == f64)) {
+    if (comptime can_try_cblas and (T == f32 or T == f64)) {
         if (m >= CBLAS_MIN_SIZE and k >= CBLAS_MIN_SIZE) {
-            blas.matVecmul(T, a, x, y, m, k);
-            return;
+            if (blas.matVecmul(T, a, x, y, m, k)) return;
         }
     }
 
@@ -344,9 +340,9 @@ pub fn dotProduct(comptime T: type, a: []const T, b: []const T) T {
     std.debug.assert(a.len == b.len);
 
     // Use CBLAS for larger vectors when available
-    if (comptime use_cblas and (T == f32 or T == f64)) {
+    if (comptime can_try_cblas and (T == f32 or T == f64)) {
         if (a.len >= CBLAS_MIN_SIZE) {
-            return blas.dot(T, a, b);
+            if (blas.dot(T, a, b)) |result| return result;
         }
     }
 

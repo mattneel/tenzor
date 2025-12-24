@@ -7,20 +7,205 @@ const std = @import("std");
 const builtin = @import("builtin");
 const options = @import("tenzor_options");
 
-// CBLAS is optional; when disabled we fall back to pure Zig kernels.
-pub const has_cblas = options.enable_blas and builtin.os.tag != .freestanding and builtin.cpu.arch != .wasm32;
+// CBLAS is optional; when unavailable at runtime we fall back to pure Zig kernels.
+pub const can_try_cblas = options.enable_blas and builtin.os.tag != .freestanding and builtin.cpu.arch != .wasm32;
 
-// Import CBLAS bindings when available
-const cblas = if (has_cblas) @import("cblas") else struct {};
+const CblasSgemmFn = *const fn (
+    layout: c_int,
+    trans_a: c_int,
+    trans_b: c_int,
+    m: c_int,
+    n: c_int,
+    k: c_int,
+    alpha: f32,
+    a: [*]const f32,
+    lda: c_int,
+    b: [*]const f32,
+    ldb: c_int,
+    beta: f32,
+    c: [*]f32,
+    ldc: c_int,
+) callconv(.c) void;
+
+const CblasDgemmFn = *const fn (
+    layout: c_int,
+    trans_a: c_int,
+    trans_b: c_int,
+    m: c_int,
+    n: c_int,
+    k: c_int,
+    alpha: f64,
+    a: [*]const f64,
+    lda: c_int,
+    b: [*]const f64,
+    ldb: c_int,
+    beta: f64,
+    c: [*]f64,
+    ldc: c_int,
+) callconv(.c) void;
+
+const CblasSgemvFn = *const fn (
+    layout: c_int,
+    trans: c_int,
+    m: c_int,
+    n: c_int,
+    alpha: f32,
+    a: [*]const f32,
+    lda: c_int,
+    x: [*]const f32,
+    incx: c_int,
+    beta: f32,
+    y: [*]f32,
+    incy: c_int,
+) callconv(.c) void;
+
+const CblasDgemvFn = *const fn (
+    layout: c_int,
+    trans: c_int,
+    m: c_int,
+    n: c_int,
+    alpha: f64,
+    a: [*]const f64,
+    lda: c_int,
+    x: [*]const f64,
+    incx: c_int,
+    beta: f64,
+    y: [*]f64,
+    incy: c_int,
+) callconv(.c) void;
+
+const CblasSdotFn = *const fn (n: c_int, a: [*]const f32, inc_a: c_int, b: [*]const f32, inc_b: c_int) callconv(.c) f32;
+const CblasDdotFn = *const fn (n: c_int, a: [*]const f64, inc_a: c_int, b: [*]const f64, inc_b: c_int) callconv(.c) f64;
+
+const CblasApi = struct {
+    sgemm: CblasSgemmFn,
+    dgemm: CblasDgemmFn,
+    sgemv: CblasSgemvFn,
+    dgemv: CblasDgemvFn,
+    sdot: CblasSdotFn,
+    ddot: CblasDdotFn,
+};
+
+pub fn has_cblas() bool {
+    return Runtime.hasCblas();
+}
+
+fn api() ?*const CblasApi {
+    return Runtime.apiPtr();
+}
+
+const Runtime = if (can_try_cblas) struct {
+    const Loaded = struct {
+        lib: std.DynLib,
+        api: CblasApi,
+    };
+
+    var once = std.once(init);
+    var loaded: bool = false;
+    var lib: std.DynLib = undefined;
+    var api_state: CblasApi = undefined;
+    var init_err: ?anyerror = null;
+
+    fn init() void {
+        const loaded_result = loadCblas() catch |err| {
+            init_err = err;
+            return;
+        };
+
+        lib = loaded_result.lib;
+        api_state = loaded_result.api;
+        loaded = true;
+    }
+
+    pub fn hasCblas() bool {
+        once.call();
+        return loaded;
+    }
+
+    pub fn apiPtr() ?*const CblasApi {
+        if (!hasCblas()) return null;
+        return &api_state;
+    }
+
+    fn loadFromPath(path: []const u8) !Loaded {
+        var dynlib = try std.DynLib.open(path);
+        errdefer dynlib.close();
+
+        const api_loaded = CblasApi{
+            .sgemm = dynlib.lookup(CblasSgemmFn, "cblas_sgemm") orelse return error.MissingSymbol,
+            .dgemm = dynlib.lookup(CblasDgemmFn, "cblas_dgemm") orelse return error.MissingSymbol,
+            .sgemv = dynlib.lookup(CblasSgemvFn, "cblas_sgemv") orelse return error.MissingSymbol,
+            .dgemv = dynlib.lookup(CblasDgemvFn, "cblas_dgemv") orelse return error.MissingSymbol,
+            .sdot = dynlib.lookup(CblasSdotFn, "cblas_sdot") orelse return error.MissingSymbol,
+            .ddot = dynlib.lookup(CblasDdotFn, "cblas_ddot") orelse return error.MissingSymbol,
+        };
+
+        return .{ .lib = dynlib, .api = api_loaded };
+    }
+
+    fn loadCblas() !Loaded {
+        if (std.process.getEnvVarOwned(std.heap.page_allocator, "TENZOR_BLAS_LIB")) |path| {
+            defer std.heap.page_allocator.free(path);
+            if (loadFromPath(path)) |loaded_result| return loaded_result else |_| {}
+        } else |_| {}
+
+        const candidates = switch (builtin.os.tag) {
+            .linux => &[_][]const u8{
+                "libopenblas.so.0",
+                "libopenblas.so",
+                "libopenblas64_.so.0",
+                "libopenblas64_.so",
+                "libopenblas64.so.0",
+                "libopenblas64.so",
+                "libopenblasp.so.0",
+                "libopenblasp.so",
+                "libcblas.so.3",
+                "libcblas.so",
+                "libblas.so.3",
+                "libblas.so",
+                "libmkl_rt.so",
+            },
+            .macos => &[_][]const u8{
+                "/System/Library/Frameworks/Accelerate.framework/Accelerate",
+                "/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate",
+                "libopenblas.dylib",
+                "libcblas.dylib",
+                "libblas.dylib",
+            },
+            .windows => &[_][]const u8{
+                "openblas.dll",
+                "libopenblas.dll",
+                "openblas64_.dll",
+                "libopenblas64_.dll",
+                "mkl_rt.dll",
+            },
+            else => &[_][]const u8{},
+        };
+
+        for (candidates) |cand| {
+            if (loadFromPath(cand)) |loaded_result| return loaded_result else |_| {}
+        }
+
+        return error.BlasUnavailable;
+    }
+} else struct {
+    pub fn hasCblas() bool {
+        return false;
+    }
+
+    pub fn apiPtr() ?*const CblasApi {
+        return null;
+    }
+};
 
 /// CBLAS matrix layout (c_uint for enum)
-const CblasRowMajor: c_uint = 101;
-const CblasColMajor: c_uint = 102;
+const CblasRowMajor: c_int = 101;
+const CblasColMajor: c_int = 102;
 
 /// CBLAS transpose options (c_uint for enum)
-const CblasNoTrans: c_uint = 111;
-const CblasTrans: c_uint = 112;
-const CblasConjTrans: c_uint = 113;
+const CblasNoTrans: c_int = 111;
+const CblasTrans: c_int = 112;
+const CblasConjTrans: c_int = 113;
 
 /// GEMM: C = alpha * A @ B + beta * C
 /// Uses CBLAS sgemm/dgemm for optimal performance.
@@ -36,10 +221,8 @@ pub fn gemm(
     beta: T,
     trans_a: bool,
     trans_b: bool,
-) void {
-    if (comptime !has_cblas) {
-        @compileError("CBLAS not available on this target");
-    }
+) bool {
+    const cblas = api() orelse return false;
 
     const m_i: c_int = @intCast(m);
     const n_i: c_int = @intCast(n);
@@ -50,11 +233,11 @@ pub fn gemm(
     const ldb: c_int = if (trans_b) k_i else n_i;
     const ldc: c_int = n_i;
 
-    const trans_a_flag: c_uint = if (trans_a) CblasTrans else CblasNoTrans;
-    const trans_b_flag: c_uint = if (trans_b) CblasTrans else CblasNoTrans;
+    const trans_a_flag: c_int = if (trans_a) CblasTrans else CblasNoTrans;
+    const trans_b_flag: c_int = if (trans_b) CblasTrans else CblasNoTrans;
 
     if (T == f32) {
-        cblas.cblas_sgemm(
+        cblas.sgemm(
             CblasRowMajor,
             trans_a_flag,
             trans_b_flag,
@@ -70,8 +253,9 @@ pub fn gemm(
             c.ptr,
             ldc,
         );
+        return true;
     } else if (T == f64) {
-        cblas.cblas_dgemm(
+        cblas.dgemm(
             CblasRowMajor,
             trans_a_flag,
             trans_b_flag,
@@ -87,8 +271,9 @@ pub fn gemm(
             c.ptr,
             ldc,
         );
+        return true;
     } else {
-        @compileError("CBLAS GEMM only supports f32 and f64");
+        return false;
     }
 }
 
@@ -101,8 +286,8 @@ pub fn matmul(
     m: usize,
     k: usize,
     n: usize,
-) void {
-    gemm(T, a, b, c, m, k, n, 1.0, 0.0, false, false);
+) bool {
+    return gemm(T, a, b, c, m, k, n, 1.0, 0.0, false, false);
 }
 
 /// Matrix-vector multiply: y = A @ x
@@ -116,18 +301,16 @@ pub fn gemv(
     alpha: T,
     beta: T,
     trans: bool,
-) void {
-    if (comptime !has_cblas) {
-        @compileError("CBLAS not available on this target");
-    }
+) bool {
+    const cblas = api() orelse return false;
 
     const m_i: c_int = @intCast(m);
     const n_i: c_int = @intCast(n);
     const lda: c_int = n_i;
-    const trans_flag: c_uint = if (trans) CblasTrans else CblasNoTrans;
+    const trans_flag: c_int = if (trans) CblasTrans else CblasNoTrans;
 
     if (T == f32) {
-        cblas.cblas_sgemv(
+        cblas.sgemv(
             CblasRowMajor,
             trans_flag,
             m_i,
@@ -141,8 +324,9 @@ pub fn gemv(
             y.ptr,
             1, // incy
         );
+        return true;
     } else if (T == f64) {
-        cblas.cblas_dgemv(
+        cblas.dgemv(
             CblasRowMajor,
             trans_flag,
             m_i,
@@ -156,8 +340,9 @@ pub fn gemv(
             y.ptr,
             1,
         );
+        return true;
     } else {
-        @compileError("CBLAS GEMV only supports f32 and f64");
+        return false;
     }
 }
 
@@ -169,9 +354,9 @@ pub fn matVecmul(
     y: []T,
     m: usize,
     k: usize,
-) void {
+) bool {
     @memset(y, 0);
-    gemv(T, a, x, y, m, k, 1.0, 0.0, false);
+    return gemv(T, a, x, y, m, k, 1.0, 0.0, false);
 }
 
 /// Vector-matrix multiply: y = x @ A
@@ -182,11 +367,11 @@ pub fn vecMatmul(
     y: []T,
     k: usize,
     n: usize,
-) void {
+) bool {
     // x @ A = (A^T @ x^T)^T, but since x and y are vectors, this simplifies
     // to using transposed GEMV
     @memset(y, 0);
-    gemv(T, a, x, y, k, n, 1.0, 0.0, true);
+    return gemv(T, a, x, y, k, n, 1.0, 0.0, true);
 }
 
 /// Dot product: result = a . b
@@ -194,19 +379,17 @@ pub fn dot(
     comptime T: type,
     a: []const T,
     b: []const T,
-) T {
-    if (comptime !has_cblas) {
-        @compileError("CBLAS not available on this target");
-    }
+) ?T {
+    const cblas = api() orelse return null;
 
     const n: c_int = @intCast(a.len);
 
     if (T == f32) {
-        return cblas.cblas_sdot(n, a.ptr, 1, b.ptr, 1);
+        return cblas.sdot(n, a.ptr, 1, b.ptr, 1);
     } else if (T == f64) {
-        return cblas.cblas_ddot(n, a.ptr, 1, b.ptr, 1);
+        return cblas.ddot(n, a.ptr, 1, b.ptr, 1);
     } else {
-        @compileError("CBLAS dot only supports f32 and f64");
+        return null;
     }
 }
 
@@ -278,13 +461,13 @@ pub fn batchedMatmulBroadcastB(
 // ============================================================================
 
 test "blas gemm 2x2" {
-    if (!has_cblas) return error.SkipZigTest;
+    if (!has_cblas()) return error.SkipZigTest;
 
     const a = [_]f32{ 1, 2, 3, 4 };
     const b = [_]f32{ 5, 6, 7, 8 };
     var c: [4]f32 = .{ 0, 0, 0, 0 };
 
-    matmul(f32, &a, &b, &c, 2, 2, 2);
+    _ = matmul(f32, &a, &b, &c, 2, 2, 2);
 
     // [[1,2],[3,4]] @ [[5,6],[7,8]] = [[19,22],[43,50]]
     try std.testing.expectApproxEqAbs(@as(f32, 19), c[0], 1e-5);
@@ -294,7 +477,7 @@ test "blas gemm 2x2" {
 }
 
 test "blas gemm larger" {
-    if (!has_cblas) return error.SkipZigTest;
+    if (!has_cblas()) return error.SkipZigTest;
 
     // 64x48 @ 48x32
     const m = 64;
@@ -309,7 +492,7 @@ test "blas gemm larger" {
     for (&a, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 10)) / 10.0;
     for (&b, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i + 3) % 10)) / 10.0;
 
-    matmul(f32, &a, &b, &c, m, k, n);
+    _ = matmul(f32, &a, &b, &c, m, k, n);
 
     // Just check it ran without crashing and produced non-zero output
     var sum: f32 = 0;
@@ -318,17 +501,17 @@ test "blas gemm larger" {
 }
 
 test "blas dot product" {
-    if (!has_cblas) return error.SkipZigTest;
+    if (!has_cblas()) return error.SkipZigTest;
 
     const a = [_]f32{ 1, 2, 3, 4 };
     const b = [_]f32{ 1, 1, 1, 1 };
 
-    const result = dot(f32, &a, &b);
+    const result = dot(f32, &a, &b).?;
     try std.testing.expectApproxEqAbs(@as(f32, 10), result, 1e-5);
 }
 
 test "blas matvec" {
-    if (!has_cblas) return error.SkipZigTest;
+    if (!has_cblas()) return error.SkipZigTest;
 
     // A = [[1,2],[3,4],[5,6]], x = [1, 2]
     // y = A @ x = [5, 11, 17]
@@ -336,7 +519,7 @@ test "blas matvec" {
     const x = [_]f32{ 1, 2 };
     var y: [3]f32 = undefined;
 
-    matVecmul(f32, &a, &x, &y, 3, 2);
+    _ = matVecmul(f32, &a, &x, &y, 3, 2);
 
     try std.testing.expectApproxEqAbs(@as(f32, 5), y[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 11), y[1], 1e-5);

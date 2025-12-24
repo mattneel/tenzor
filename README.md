@@ -8,6 +8,7 @@ A compile-time tensor library for Zig with zero-cost abstractions.
 - **Zero-cost abstractions** - Expression graphs with no runtime overhead
 - **Lazy evaluation** - Operations fuse automatically for optimal performance
 - **SIMD acceleration** - Vectorized kernels for all element-wise operations
+- **Optional BLAS acceleration** - Uses system BLAS when available (fallbacks to pure Zig)
 - **Multi-threaded** - Parallel execution with work-stealing thread pool
 - **Production training CLI** - TUI dashboard, checkpointing, LR scheduling
 - **HuggingFace integration** - Download and convert models from HF Hub
@@ -69,6 +70,15 @@ const tenzor = b.dependency("tenzor", .{
 });
 exe.root_module.addImport("tenzor", tenzor.module("tenzor"));
 ```
+
+## BLAS acceleration (optional)
+
+By default, Tenzor will attempt to load a system BLAS implementation at runtime
+(Accelerate on macOS; OpenBLAS/MKL on Linux/Windows). If it can’t, it
+automatically falls back to pure Zig kernels.
+
+- Disable at compile time: `-Dblas=false`
+- Override the library path: set `TENZOR_BLAS_LIB=/path/to/libopenblas.so`
 
 ## Operations
 

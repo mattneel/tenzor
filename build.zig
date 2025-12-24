@@ -1,5 +1,4 @@
 const std = @import("std");
-const blas_build = @import("libs/blas/build.zig");
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -22,13 +21,7 @@ pub fn build(b: *std.Build) void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
-    const enable_blas = b.option(bool, "blas", "Enable system BLAS (OpenBLAS) acceleration") orelse false;
-
-    // Optional system BLAS with translate-c for high-performance BLAS operations.
-    // Disabled by default so cross-compiles (musl, Windows, etc.) don't require cblas headers/libs.
-    const cblas_mod: ?*std.Build.Module = if (enable_blas) blk: {
-        break :blk blas_build.addBlas(b, target, optimize);
-    } else null;
+    const enable_blas = b.option(bool, "blas", "Enable BLAS acceleration (uses system BLAS at runtime when available)") orelse true;
 
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -53,13 +46,6 @@ pub fn build(b: *std.Build) void {
     const tenzor_options = b.addOptions();
     tenzor_options.addOption(bool, "enable_blas", enable_blas);
     mod.addOptions("tenzor_options", tenzor_options);
-
-    if (cblas_mod) |cblas| {
-        // Add CBLAS module for high-performance BLAS access
-        mod.addImport("cblas", cblas);
-        // Link OpenBLAS directly (provides CBLAS interface)
-        mod.linkSystemLibrary("openblas", .{ .preferred_link_mode = .dynamic });
-    }
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
