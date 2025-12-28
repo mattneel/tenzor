@@ -23,6 +23,13 @@ pub fn build(b: *std.Build) void {
 
     const enable_blas = b.option(bool, "blas", "Enable BLAS acceleration (uses system BLAS at runtime when available)") orelse true;
 
+    // Blazt: pure Zig BLAS fallback when no vendor library is available
+    const blazt_dep = b.dependency("blazt", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const blazt_mod = blazt_dep.module("blazt");
+
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
     // Zig modules are the preferred way of making Zig code available to consumers.
@@ -41,6 +48,9 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        .imports = &.{
+            .{ .name = "blazt", .module = blazt_mod },
+        },
     });
 
     const tenzor_options = b.addOptions();

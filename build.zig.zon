@@ -39,6 +39,10 @@
             .url = "git+https://github.com/mattneel/ziterion#2eba9bb66b7c2a8ffddef17c002c7fe2d3417f16",
             .hash = "ziterion-0.0.0-_wU4-EtIBADSLUOeSpGz6NA-W6ag698OkDvT40fRUCo9",
         },
+        .blazt = .{
+            .url = "git+https://github.com/mattneel/blazt#b87463262a959a8656cd12e77af599ae56bcd88e",
+            .hash = "blazt-0.0.0-z08ahADzBACadrq_oZLvZ-6Wqds3QG7rFDzeGgjUFu3P",
+        },
     },
     .paths = .{
         "build.zig",

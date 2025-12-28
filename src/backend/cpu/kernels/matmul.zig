@@ -10,6 +10,7 @@ const std = @import("std");
 const simd = @import("../simd.zig");
 const threading = @import("../threading.zig");
 const blas = @import("blas.zig");
+const blazt_backend = @import("blazt_backend.zig");
 
 /// Whether this build can attempt runtime CBLAS acceleration.
 pub const can_try_cblas = blas.can_try_cblas;
@@ -66,7 +67,12 @@ pub fn matmulTransposeB(
         }
     }
 
-    // Fall back to pure Zig implementation for small matrices or non-CBLAS targets
+    // Fall back to Blazt (pure Zig BLAS) for optimized GEMM with transpose
+    if (comptime T == f32 or T == f64) {
+        if (blazt_backend.gemm(T, a, b, c, m, k, n, 1.0, 0.0, false, true)) return;
+    }
+
+    // Fall back to pure Zig for non-float types or unaligned data
     matmulTransposeBPureZig(T, a, b, c, m, k, n);
 }
 
@@ -97,7 +103,7 @@ fn matmulTransposeBPureZig(
 
 /// Tiled matrix multiplication: C = A @ B
 /// Uses blocking for cache efficiency. Delegates to CBLAS for larger matrices
-/// when available on native targets.
+/// when available on native targets, falls back to Blazt (pure Zig BLAS).
 pub fn matmulTiled(
     comptime T: type,
     a: []const T,
@@ -114,7 +120,12 @@ pub fn matmulTiled(
         }
     }
 
-    // Fall back to pure Zig implementation for small matrices or non-CBLAS targets
+    // Fall back to Blazt (pure Zig BLAS) for optimized GEMM (requires aligned data)
+    if (comptime T == f32 or T == f64) {
+        if (blazt_backend.matmul(T, a, b, c, m, k, n)) return;
+    }
+
+    // Fall back to pure Zig for non-float types or unaligned data
     matmulTiledPureZig(T, a, b, c, m, k, n);
 }
 
@@ -246,6 +257,11 @@ pub fn vecMatmul(
         }
     }
 
+    // Fall back to Blazt (requires aligned data)
+    if (comptime T == f32 or T == f64) {
+        if (blazt_backend.vecMatmul(T, x, a, y, k, n)) return;
+    }
+
     vecMatmulPureZig(T, x, a, y, k, n);
 }
 
@@ -301,6 +317,11 @@ pub fn matVecmul(
         }
     }
 
+    // Fall back to Blazt (requires aligned data)
+    if (comptime T == f32 or T == f64) {
+        if (blazt_backend.matVecmul(T, a, x, y, m, k)) return;
+    }
+
     matVecmulPureZig(T, a, x, y, m, k);
 }
 
@@ -344,6 +365,11 @@ pub fn dotProduct(comptime T: type, a: []const T, b: []const T) T {
         if (a.len >= CBLAS_MIN_SIZE) {
             if (blas.dot(T, a, b)) |result| return result;
         }
+    }
+
+    // Fall back to Blazt (dot doesn't require alignment)
+    if (comptime T == f32 or T == f64) {
+        if (blazt_backend.dot(T, a, b)) |result| return result;
     }
 
     return dotProductPureZig(T, a, b);
