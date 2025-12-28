@@ -3,6 +3,7 @@
 //! Subcommands:
 //!   train    Train LeNet-5 on MNIST dataset
 //!   embed    Generate text embeddings with Arctic-embed-xs
+//!   onnx     Load and run ONNX models
 //!   convert  Convert model formats (safetensors -> .tenzor)
 
 const std = @import("std");
@@ -163,6 +164,43 @@ fn run(allocator: std.mem.Allocator) !void {
         };
 
         try runConvert(allocator, input_path, output_path);
+    } else if (std.mem.eql(u8, subcommand, "onnx")) {
+        // ONNX subcommands
+        if (positionals.len < 2) {
+            std.debug.print("Error: onnx requires a subcommand\n", .{});
+            std.debug.print("Usage: tenzor onnx <info|download|run> [OPTIONS]\n\n", .{});
+            return printHelp(&params);
+        }
+
+        const onnx_cmd = positionals[1];
+
+        if (std.mem.eql(u8, onnx_cmd, "info")) {
+            if (positionals.len < 3) {
+                std.debug.print("Error: onnx info requires file path\n", .{});
+                std.debug.print("Usage: tenzor onnx info <model.onnx>\n\n", .{});
+                return printHelp(&params);
+            }
+            try runOnnxInfo(allocator, positionals[2]);
+        } else if (std.mem.eql(u8, onnx_cmd, "download")) {
+            if (positionals.len < 4) {
+                std.debug.print("Error: onnx download requires model_id and onnx_file\n", .{});
+                std.debug.print("Usage: tenzor onnx download <model_id> <onnx_file>\n", .{});
+                std.debug.print("Example: tenzor onnx download ResembleAI/chatterbox-turbo-ONNX embed_tokens.onnx\n\n", .{});
+                return printHelp(&params);
+            }
+            try runOnnxDownload(allocator, positionals[2], positionals[3]);
+        } else if (std.mem.eql(u8, onnx_cmd, "run")) {
+            if (positionals.len < 3) {
+                std.debug.print("Error: onnx run requires file path\n", .{});
+                std.debug.print("Usage: tenzor onnx run <model.onnx>\n\n", .{});
+                return printHelp(&params);
+            }
+            try runOnnxRun(allocator, positionals[2]);
+        } else {
+            std.debug.print("Unknown onnx command: {s}\n", .{onnx_cmd});
+            std.debug.print("Available: info, download, run\n\n", .{});
+            return printHelp(&params);
+        }
     } else if (std.mem.eql(u8, subcommand, "help")) {
         return printHelp(&params);
     } else {
@@ -182,6 +220,7 @@ fn printHelp(params: anytype) error{Help} {
         \\  train    Train LeNet-5 on MNIST dataset
         \\  eval     Evaluate model checkpoint on test data
         \\  embed    Generate text embeddings with Arctic-embed-xs
+        \\  onnx     Load and run ONNX models
         \\  download Download model from HuggingFace Hub
         \\  convert  Convert safetensors to .tenzor format
         \\  info     Show .tenzor file information
@@ -214,6 +253,11 @@ fn printHelp(params: anytype) error{Help} {
         \\  <MODEL_ID>              HuggingFace model ID (e.g., Snowflake/snowflake-arctic-embed-xs)
         \\  -o, --output <PATH>     Output .tenzor file (default: cache directory)
         \\
+        \\ONNX OPTIONS:
+        \\  onnx info <FILE>        Show ONNX model structure
+        \\  onnx download <ID> <F>  Download ONNX model from HuggingFace
+        \\  onnx run <FILE>         Run inference on ONNX model
+        \\
         \\CONVERT OPTIONS:
         \\  <INPUT>                 Input .safetensors file
         \\  -o, --output <PATH>     Output .tenzor file (default: <input>.tenzor)
@@ -223,6 +267,8 @@ fn printHelp(params: anytype) error{Help} {
         \\  tenzor train -e 20 --scheduler cosine --warmup 500 --checkpoint ckpt/
         \\  tenzor eval ckpt/best.tenzor -d data/mnist
         \\  tenzor embed --model models/arctic-embed-xs/model.safetensors "Hello world"
+        \\  tenzor onnx info model.onnx
+        \\  tenzor onnx download ResembleAI/chatterbox-turbo-ONNX embed_tokens.onnx
         \\  tenzor download Snowflake/snowflake-arctic-embed-xs
         \\  tenzor convert model.safetensors -o model.tenzor
         \\  tenzor info model.tenzor
@@ -1092,6 +1138,398 @@ fn runInfo(allocator: std.mem.Allocator, path: []const u8) !void {
     }
 
     std.debug.print("\nTotal parameters: {d} ({d:.2} M)\n", .{ total_params, @as(f64, @floatFromInt(total_params)) / 1_000_000 });
+}
+
+// ============================================================================
+// ONNX Commands
+// ============================================================================
+
+fn runOnnxInfo(allocator: std.mem.Allocator, path: []const u8) !void {
+    const onnx = tenzor.onnx;
+
+    std.debug.print("ONNX Model Info\n", .{});
+    std.debug.print("===============\n", .{});
+    std.debug.print("Path: {s}\n\n", .{path});
+
+    // Read file
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        std.debug.print("Error opening file: {}\n", .{err});
+        return err;
+    };
+    defer file.close();
+
+    const stat = try file.stat();
+    const data = try allocator.alloc(u8, stat.size);
+    defer allocator.free(data);
+
+    var total_read: usize = 0;
+    while (total_read < stat.size) {
+        const n = try file.read(data[total_read..]);
+        if (n == 0) break;
+        total_read += n;
+    }
+
+    std.debug.print("File size: {d:.2} KB\n\n", .{@as(f64, @floatFromInt(stat.size)) / 1024});
+
+    // Parse model
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const model = onnx.parser.parseModel(arena.allocator(), data[0..total_read]) catch |err| {
+        std.debug.print("Error parsing ONNX: {}\n", .{err});
+        return err;
+    };
+
+    // Print model info
+    std.debug.print("IR version: {}\n", .{model.ir_version});
+    if (model.producer_name) |name| {
+        std.debug.print("Producer: {s}\n", .{name});
+    }
+    if (model.producer_version) |ver| {
+        std.debug.print("Producer version: {s}\n", .{ver});
+    }
+
+    // Opset imports
+    std.debug.print("\nOpset imports: {}\n", .{model.opset_import.len});
+    for (model.opset_import) |opset| {
+        if (opset.domain) |domain| {
+            if (domain.len > 0) {
+                std.debug.print("  {s}: v{}\n", .{ domain, opset.version });
+            } else {
+                std.debug.print("  (default): v{}\n", .{opset.version});
+            }
+        } else {
+            std.debug.print("  (default): v{}\n", .{opset.version});
+        }
+    }
+
+    // Graph info
+    if (model.graph) |graph| {
+        if (graph.name) |name| {
+            std.debug.print("\nGraph: {s}\n", .{name});
+        } else {
+            std.debug.print("\nGraph:\n", .{});
+        }
+
+        std.debug.print("  Inputs:  {}\n", .{graph.input.len});
+        for (graph.input) |input| {
+            if (input.name) |name| {
+                std.debug.print("    - {s}\n", .{name});
+            }
+        }
+
+        std.debug.print("  Outputs: {}\n", .{graph.output.len});
+        for (graph.output) |output| {
+            if (output.name) |name| {
+                std.debug.print("    - {s}\n", .{name});
+            }
+        }
+
+        std.debug.print("  Nodes:   {}\n", .{graph.node.len});
+
+        // Count ops
+        var op_counts = std.StringHashMap(u32).init(allocator);
+        defer op_counts.deinit();
+
+        for (graph.node) |node| {
+            if (node.op_type) |op| {
+                const entry = op_counts.getOrPut(op) catch continue;
+                if (!entry.found_existing) {
+                    entry.value_ptr.* = 0;
+                }
+                entry.value_ptr.* += 1;
+            }
+        }
+
+        std.debug.print("  Op distribution:\n", .{});
+        var it = op_counts.iterator();
+        while (it.next()) |entry| {
+            std.debug.print("    {s}: {}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        }
+
+        // Initializers (weights)
+        std.debug.print("  Initializers: {}\n", .{graph.initializer.len});
+
+        var external_count: usize = 0;
+        var inline_count: usize = 0;
+        var total_bytes: usize = 0;
+
+        for (graph.initializer) |tensor| {
+            if (tensor.isExternal()) {
+                external_count += 1;
+            } else {
+                inline_count += 1;
+                if (tensor.raw_data) |rd| {
+                    total_bytes += rd.len;
+                }
+            }
+        }
+
+        std.debug.print("    Inline:   {} ({d:.2} KB)\n", .{ inline_count, @as(f64, @floatFromInt(total_bytes)) / 1024 });
+        std.debug.print("    External: {}\n", .{external_count});
+
+        if (external_count > 0) {
+            std.debug.print("  External data files:\n", .{});
+            var seen = std.StringHashMap(void).init(allocator);
+            defer seen.deinit();
+
+            for (graph.initializer) |tensor| {
+                if (tensor.getExternalLocation()) |loc| {
+                    if (!seen.contains(loc)) {
+                        seen.put(loc, {}) catch continue;
+                        std.debug.print("    - {s}\n", .{loc});
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn runOnnxDownload(allocator: std.mem.Allocator, model_id: []const u8, onnx_file: []const u8) !void {
+    const HuggingFace = tenzor.io.huggingface.HuggingFace;
+
+    std.debug.print("ONNX Model Download\n", .{});
+    std.debug.print("===================\n", .{});
+    std.debug.print("Model: {s}\n", .{model_id});
+    std.debug.print("File:  {s}\n\n", .{onnx_file});
+
+    var hf = HuggingFace.init(allocator, null);
+    defer hf.deinit();
+
+    const start_time = std.time.Instant.now() catch null;
+
+    var info = hf.downloadOnnxModelAuto(model_id, onnx_file) catch |err| {
+        std.debug.print("Error: {}\n", .{err});
+        return err;
+    };
+    defer info.deinit();
+
+    const elapsed_ns: u64 = if (start_time) |start| blk: {
+        const end = std.time.Instant.now() catch break :blk 0;
+        break :blk end.since(start);
+    } else 0;
+    const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+
+    // Get file sizes
+    const stat = try std.fs.cwd().statFile(info.model_path);
+
+    std.debug.print("\nDownload complete!\n", .{});
+    std.debug.print("  Model:    {s}\n", .{info.model_path});
+    std.debug.print("  Size:     {d:.2} KB\n", .{@as(f64, @floatFromInt(stat.size)) / 1024});
+    std.debug.print("  External: {} files\n", .{info.external_files.len});
+    for (info.external_files) |f| {
+        const ext_stat = std.fs.cwd().statFile(f) catch continue;
+        std.debug.print("    - {s} ({d:.2} MB)\n", .{
+            std.fs.path.basename(f),
+            @as(f64, @floatFromInt(ext_stat.size)) / (1024 * 1024),
+        });
+    }
+    std.debug.print("  Time:     {d:.1} s\n", .{elapsed_s});
+}
+
+fn runOnnxRun(allocator: std.mem.Allocator, path: []const u8) !void {
+    const onnx = tenzor.onnx;
+
+    std.debug.print("ONNX Model Run\n", .{});
+    std.debug.print("==============\n", .{});
+    std.debug.print("Path: {s}\n\n", .{path});
+
+    // Read file
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        std.debug.print("Error opening file: {}\n", .{err});
+        return err;
+    };
+    defer file.close();
+
+    const stat = try file.stat();
+    const data = try allocator.alloc(u8, stat.size);
+    defer allocator.free(data);
+
+    var total_read: usize = 0;
+    while (total_read < stat.size) {
+        const n = try file.read(data[total_read..]);
+        if (n == 0) break;
+        total_read += n;
+    }
+
+    // Build runtime graph
+    std.debug.print("Building graph...\n", .{});
+    var graph = onnx.buildFromBytes(allocator, data[0..total_read]) catch |err| {
+        std.debug.print("Error building graph: {}\n", .{err});
+        return err;
+    };
+    defer graph.deinit();
+
+    std.debug.print("  Nodes:   {}\n", .{graph.nodes.items.len});
+    std.debug.print("  Tensors: {}\n", .{graph.tensors.items.len});
+    std.debug.print("  Inputs:  {}\n", .{graph.inputs.len});
+    std.debug.print("  Outputs: {}\n", .{graph.outputs.len});
+
+    // Create executor
+    std.debug.print("\nInitializing executor...\n", .{});
+    var exec = onnx.Executor.init(allocator, &graph) catch |err| {
+        std.debug.print("Error creating executor: {}\n", .{err});
+        return err;
+    };
+    defer exec.deinit();
+
+    // Load weights
+    std.debug.print("Loading weights...\n", .{});
+    try exec.loadWeights();
+
+    // Try loading external weights
+    const model_dir = std.fs.path.dirname(path) orelse ".";
+    exec.loadExternalWeights(model_dir) catch |err| {
+        std.debug.print("  External weights: {} (skipped)\n", .{err});
+    };
+
+    // Print input requirements
+    std.debug.print("\nModel requires {} input(s):\n", .{graph.inputs.len});
+    for (graph.inputs) |input_idx| {
+        const info = graph.tensors.items[input_idx];
+        std.debug.print("  - {s}: {s} [", .{ info.name, @tagName(info.dtype) });
+        for (info.shape, 0..) |dim, i| {
+            if (i > 0) std.debug.print(", ", .{});
+            if (dim < 0) {
+                std.debug.print("?", .{});
+            } else {
+                std.debug.print("{}", .{dim});
+            }
+        }
+        std.debug.print("]\n", .{});
+    }
+
+    // Run inference with test input based on what the model expects
+    std.debug.print("\nRunning inference with test data...\n", .{});
+
+    // Detect input type and provide appropriate test data
+    const first_input_idx = graph.inputs[0];
+    const first_input = graph.tensors.items[first_input_idx];
+
+    if (std.mem.eql(u8, first_input.name, "input_ids")) {
+        // Token-based model (embed_tokens)
+        const test_tokens = [_]i64{ 1, 2, 3, 4, 5 };
+        const input_shape = [_]i64{ 1, 5 };
+        exec.setInputFromSlice("input_ids", i64, &test_tokens, &input_shape) catch |err| {
+            std.debug.print("Error setting input_ids: {}\n", .{err});
+            return err;
+        };
+        std.debug.print("  input_ids: [1, 2, 3, 4, 5] shape=[1, 5]\n", .{});
+    } else if (std.mem.eql(u8, first_input.name, "inputs_embeds")) {
+        // Embedding-based model (language_model)
+        // Create dummy embeddings: [batch=1, seq=1, dim=1024]
+        var test_embeds: [1024]f32 = undefined;
+        for (&test_embeds, 0..) |*v, i| {
+            v.* = @as(f32, @floatFromInt(i)) * 0.001;
+        }
+        const embed_shape = [_]i64{ 1, 1, 1024 };
+        exec.setInputFromSlice("inputs_embeds", f32, &test_embeds, &embed_shape) catch |err| {
+            std.debug.print("Error setting inputs_embeds: {}\n", .{err});
+            return err;
+        };
+        std.debug.print("  inputs_embeds: shape=[1, 1, 1024]\n", .{});
+
+        // Set attention_mask
+        const attn_mask = [_]i64{1};
+        const mask_shape = [_]i64{ 1, 1 };
+        exec.setInputFromSlice("attention_mask", i64, &attn_mask, &mask_shape) catch {};
+
+        // Set position_ids
+        const pos_ids = [_]i64{0};
+        exec.setInputFromSlice("position_ids", i64, &pos_ids, &mask_shape) catch {};
+
+        // Set empty KV caches (24 layers) - use f16 to match model expectations
+        var kv_cache_f16: [0]f16 = .{};
+        const kv_shape = [_]i64{ 1, 16, 0, 64 }; // batch, heads, seq=0, head_dim
+        for (0..24) |layer| {
+            var key_buf: [64]u8 = undefined;
+            var val_buf: [64]u8 = undefined;
+            const key_name = std.fmt.bufPrint(&key_buf, "past_key_values.{}.key", .{layer}) catch continue;
+            const val_name = std.fmt.bufPrint(&val_buf, "past_key_values.{}.value", .{layer}) catch continue;
+            exec.setInputFromSlice(key_name, f16, &kv_cache_f16, &kv_shape) catch |err| {
+                std.debug.print("Failed to set {s}: {}\n", .{key_name, err});
+            };
+            exec.setInputFromSlice(val_name, f16, &kv_cache_f16, &kv_shape) catch |err| {
+                std.debug.print("Failed to set {s}: {}\n", .{val_name, err});
+            };
+        }
+        std.debug.print("  Set all 51 inputs for language model\n", .{});
+    } else if (std.mem.eql(u8, first_input.name, "audio_values")) {
+        // Audio waveform input (speech_encoder)
+        // Create dummy audio: [batch=1, samples=80000] (5 seconds at 16kHz - required for voice cloning)
+        var test_audio: [80000]f32 = undefined;
+        for (&test_audio, 0..) |*v, i| {
+            // Simple sine wave at 440Hz
+            const t: f32 = @as(f32, @floatFromInt(i)) / 16000.0;
+            v.* = @sin(t * 440.0 * 2.0 * std.math.pi);
+        }
+        const audio_shape = [_]i64{ 1, 80000 };
+        exec.setInputFromSlice("audio_values", f32, &test_audio, &audio_shape) catch |err| {
+            std.debug.print("Error setting audio_values: {}\n", .{err});
+            return err;
+        };
+        std.debug.print("  audio_values: shape=[1, 80000] (5sec @ 16kHz)\n", .{});
+    } else if (std.mem.eql(u8, first_input.name, "prompt")) {
+        // Conditional decoder input
+        // prompt is the speech encoder output: [batch=1, seq=~50, dim=1024]
+        var test_prompt: [50 * 1024]f32 = undefined;
+        for (&test_prompt, 0..) |*v, i| {
+            v.* = @as(f32, @floatFromInt(i % 1024)) * 0.001;
+        }
+        const prompt_shape = [_]i64{ 1, 50, 1024 };
+        exec.setInputFromSlice("prompt", f32, &test_prompt, &prompt_shape) catch |err| {
+            std.debug.print("Error setting prompt: {}\n", .{err});
+            return err;
+        };
+        std.debug.print("  prompt: shape=[1, 50, 1024]\n", .{});
+    } else {
+        std.debug.print("Unknown input type: {s}\n", .{first_input.name});
+        std.debug.print("Skipping inference.\n", .{});
+        return;
+    }
+
+    // Execute
+    const start_time = std.time.Instant.now() catch null;
+    exec.run() catch |err| {
+        std.debug.print("Error during inference: {}\n", .{err});
+        return err;
+    };
+    const elapsed_ns: u64 = if (start_time) |start| blk: {
+        const end = std.time.Instant.now() catch break :blk 0;
+        break :blk end.since(start);
+    } else 0;
+
+    std.debug.print("  Inference complete in {d:.2} ms\n", .{@as(f64, @floatFromInt(elapsed_ns)) / 1_000_000});
+
+    // Get first output
+    if (graph.outputs.len > 0) {
+        const out_idx = graph.outputs[0];
+        const out_info = graph.tensors.items[out_idx];
+        if (exec.getOutput(out_info.name)) |output| {
+            std.debug.print("\nOutput '{s}':\n", .{out_info.name});
+            std.debug.print("  dtype: {s}\n", .{@tagName(output.dtype)});
+            std.debug.print("  shape: [", .{});
+            for (output.shape, 0..) |dim, i| {
+                if (i > 0) std.debug.print(", ", .{});
+                std.debug.print("{}", .{dim});
+            }
+            std.debug.print("]\n", .{});
+            std.debug.print("  numel: {}\n", .{output.numel});
+
+            // Print first few values
+            if (output.dtype == .f32) {
+                if (output.asSlice(f32)) |values| {
+                    const num_to_show = @min(values.len, 10);
+                    std.debug.print("  first {} values: [", .{num_to_show});
+                    for (values[0..num_to_show], 0..) |v, i| {
+                        if (i > 0) std.debug.print(", ", .{});
+                        std.debug.print("{d:.4}", .{v});
+                    }
+                    std.debug.print("]\n", .{});
+                }
+            }
+        }
+    }
 }
 
 test "main imports" {

@@ -46,6 +46,9 @@ pub const io = struct {
     pub const tokenizer = @import("io/tokenizer.zig");
 };
 
+// ONNX runtime
+pub const onnx = @import("onnx/root.zig");
+
 // Model implementations
 pub const model = struct {
     pub const arctic = @import("model/arctic.zig");
@@ -154,6 +157,9 @@ test {
     _ = io.huggingface;
     _ = io.mnist;
     _ = io.tokenizer;
+
+    // ONNX tests
+    _ = onnx;
 
     // Model tests
     _ = model.arctic;

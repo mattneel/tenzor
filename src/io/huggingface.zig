@@ -279,6 +279,185 @@ pub const HuggingFace = struct {
 
         return tenzor_path;
     }
+
+    pub const OnnxModelInfo = struct {
+        /// Path to the .onnx file
+        model_path: []const u8,
+        /// Directory containing model and external data
+        model_dir: []const u8,
+        /// List of downloaded external data files
+        external_files: []const []const u8,
+        allocator: std.mem.Allocator,
+
+        pub fn deinit(self: *OnnxModelInfo) void {
+            self.allocator.free(self.model_path);
+            self.allocator.free(self.model_dir);
+            for (self.external_files) |f| self.allocator.free(f);
+            self.allocator.free(self.external_files);
+        }
+    };
+
+    /// Download an ONNX model and its external data files from HuggingFace Hub.
+    ///
+    /// model_id: e.g., "ResembleAI/chatterbox-turbo-ONNX"
+    /// onnx_file: e.g., "embed_tokens.onnx" or "onnx/model.onnx"
+    /// external_data_files: list of external data files to download, e.g., &.{"embed_tokens.onnx_data"}
+    pub fn downloadOnnxModel(
+        self: *HuggingFace,
+        model_id: []const u8,
+        onnx_file: []const u8,
+        external_data_files: []const []const u8,
+    ) DownloadError!OnnxModelInfo {
+        if (model_id.len == 0) return error.InvalidModelId;
+
+        // Create cache directory
+        const model_dir = self.getModelCacheDir(model_id) catch return error.IoError;
+        errdefer self.allocator.free(model_dir);
+
+        std.fs.cwd().makePath(model_dir) catch return error.IoError;
+
+        // Download the .onnx file
+        const onnx_local = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{
+            model_dir,
+            std.fs.path.basename(onnx_file),
+        }) catch return error.OutOfMemory;
+        errdefer self.allocator.free(onnx_local);
+
+        // Check cache first
+        if (std.fs.cwd().access(onnx_local, .{})) |_| {
+            std.debug.print("  Using cached: {s}\n", .{std.fs.path.basename(onnx_file)});
+        } else |_| {
+            const url = std.fmt.allocPrint(
+                self.allocator,
+                "{s}/{s}/resolve/main/{s}",
+                .{ HF_BASE_URL, model_id, onnx_file },
+            ) catch return error.OutOfMemory;
+            defer self.allocator.free(url);
+
+            std.debug.print("  Downloading: {s}...\n", .{onnx_file});
+            self.downloadFile(url, onnx_local) catch return error.ModelNotFound;
+        }
+
+        // Download external data files
+        var ext_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (ext_paths.items) |p| self.allocator.free(p);
+            ext_paths.deinit(self.allocator);
+        }
+
+        for (external_data_files) |ext_file| {
+            const ext_local = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{
+                model_dir,
+                std.fs.path.basename(ext_file),
+            }) catch return error.OutOfMemory;
+            errdefer self.allocator.free(ext_local);
+
+            if (std.fs.cwd().access(ext_local, .{})) |_| {
+                std.debug.print("  Using cached: {s}\n", .{std.fs.path.basename(ext_file)});
+            } else |_| {
+                const url = std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}/{s}/resolve/main/{s}",
+                    .{ HF_BASE_URL, model_id, ext_file },
+                ) catch return error.OutOfMemory;
+                defer self.allocator.free(url);
+
+                std.debug.print("  Downloading: {s}...\n", .{ext_file});
+                self.downloadFile(url, ext_local) catch {
+                    self.allocator.free(ext_local);
+                    continue; // Skip optional files
+                };
+            }
+
+            ext_paths.append(self.allocator, ext_local) catch return error.OutOfMemory;
+        }
+
+        return OnnxModelInfo{
+            .model_path = onnx_local,
+            .model_dir = model_dir,
+            .external_files = ext_paths.toOwnedSlice(self.allocator) catch return error.OutOfMemory,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Download an ONNX model, automatically detecting external data files from the model.
+    /// Parses the .onnx file to find external data references.
+    pub fn downloadOnnxModelAuto(
+        self: *HuggingFace,
+        model_id: []const u8,
+        onnx_file: []const u8,
+    ) DownloadError!OnnxModelInfo {
+        // First download just the .onnx file
+        var info = try self.downloadOnnxModel(model_id, onnx_file, &.{});
+        errdefer info.deinit();
+
+        // Parse it to find external data references
+        const onnx = @import("../onnx/root.zig");
+        const data = self.readFile(info.model_path) catch return error.IoError;
+        defer self.allocator.free(data);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        const model = onnx.parser.parseModel(arena.allocator(), data) catch return error.ParseError;
+
+        // Collect unique external data locations
+        var ext_files = std.StringHashMap(void).init(self.allocator);
+        defer ext_files.deinit();
+
+        if (model.graph) |graph| {
+            for (graph.initializer) |tensor| {
+                if (tensor.getExternalLocation()) |loc| {
+                    ext_files.put(loc, {}) catch return error.OutOfMemory;
+                }
+            }
+        }
+
+        // Download external files
+        var ext_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer ext_list.deinit(self.allocator);
+
+        var it = ext_files.keyIterator();
+        while (it.next()) |key| {
+            // Build path relative to onnx file
+            const dir = std.fs.path.dirname(onnx_file) orelse "";
+            const ext_path = if (dir.len > 0)
+                std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, key.* }) catch return error.OutOfMemory
+            else
+                self.allocator.dupe(u8, key.*) catch return error.OutOfMemory;
+            defer self.allocator.free(ext_path);
+
+            const ext_local = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{
+                info.model_dir,
+                std.fs.path.basename(ext_path),
+            }) catch return error.OutOfMemory;
+
+            if (std.fs.cwd().access(ext_local, .{})) |_| {
+                std.debug.print("  Using cached: {s}\n", .{key.*});
+                ext_list.append(self.allocator, ext_local) catch return error.OutOfMemory;
+            } else |_| {
+                const url = std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}/{s}/resolve/main/{s}",
+                    .{ HF_BASE_URL, model_id, ext_path },
+                ) catch return error.OutOfMemory;
+                defer self.allocator.free(url);
+
+                std.debug.print("  Downloading: {s}...\n", .{key.*});
+                if (self.downloadFile(url, ext_local)) |_| {
+                    ext_list.append(self.allocator, ext_local) catch return error.OutOfMemory;
+                } else |_| {
+                    self.allocator.free(ext_local);
+                }
+            }
+        }
+
+        // Update info with external files
+        self.allocator.free(info.external_files);
+        info.external_files = ext_list.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+
+        return info;
+    }
 };
 
 // ============================================================================

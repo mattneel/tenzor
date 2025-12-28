@@ -23,45 +23,29 @@ pub const ThreadPoolConfig = struct {
 };
 
 /// A simple thread pool for parallel tensor operations.
-/// Note: This struct must not be moved after init due to self-referential pointers.
-/// Use create() to allocate on heap, or init() with a stable pointer.
+/// Uses raw thread spawning with WaitGroup for synchronization.
 pub const ThreadPool = struct {
-    pool: std.Thread.Pool,
     thread_count: u32,
     allocator: std.mem.Allocator,
+    stack_size: usize,
 
     const Self = @This();
 
-    /// Initialize the thread pool in place (struct must not be moved after this).
-    pub fn init(self: *Self, config: ThreadPoolConfig) !void {
-        const cpu_count: u32 = @intCast(std.Thread.getCpuCount() catch 4);
-        self.thread_count = config.thread_count orelse cpu_count;
-
-        try self.pool.init(.{
-            .allocator = self.allocator,
-            .n_jobs = self.thread_count,
-            .stack_size = config.stack_size,
-        });
-    }
-
     /// Create a heap-allocated thread pool.
     pub fn create(allocator: std.mem.Allocator, config: ThreadPoolConfig) !*Self {
+        const cpu_count: u32 = @intCast(std.Thread.getCpuCount() catch 4);
         const self = try allocator.create(Self);
-        self.allocator = allocator;
-        errdefer allocator.destroy(self);
-        try self.init(config);
+        self.* = .{
+            .thread_count = config.thread_count orelse cpu_count,
+            .allocator = allocator,
+            .stack_size = config.stack_size,
+        };
         return self;
-    }
-
-    /// Deinitialize the thread pool.
-    pub fn deinit(self: *Self) void {
-        self.pool.deinit();
     }
 
     /// Destroy a heap-allocated thread pool.
     pub fn destroy(self: *Self) void {
         const allocator = self.allocator;
-        self.deinit();
         allocator.destroy(self);
     }
 
@@ -86,26 +70,50 @@ pub const ThreadPool = struct {
             return;
         }
 
-        // Spawn work for each chunk
+        // Calculate number of chunks
+        const num_chunks = (total + chunk_size - 1) / chunk_size;
+        const threads_to_use = @min(num_chunks, self.thread_count);
+
+        if (threads_to_use <= 1) {
+            func(context, start, end);
+            return;
+        }
+
+        // Spawn worker threads
         var wg: std.Thread.WaitGroup = .{};
+        var threads_spawned: u32 = 0;
 
         var chunk_start = start;
-        while (chunk_start < end) {
+        while (chunk_start < end and threads_spawned < threads_to_use - 1) {
             const chunk_end = @min(chunk_start + chunk_size, end);
-            const cs = chunk_start;
-            const ce = chunk_end;
 
-            self.pool.spawnWg(&wg, struct {
-                fn work(ctx: @TypeOf(context), s: usize, e: usize) void {
-                    func(ctx, s, e);
+            const spawn_config: std.Thread.SpawnConfig = .{
+                .stack_size = self.stack_size,
+            };
+
+            wg.start();
+            _ = std.Thread.spawn(spawn_config, struct {
+                fn work(ctx: @TypeOf(context), cs: usize, ce: usize, wait_group: *std.Thread.WaitGroup) void {
+                    defer wait_group.finish();
+                    func(ctx, cs, ce);
                 }
-            }.work, .{ context, cs, ce });
+            }.work, .{ context, chunk_start, chunk_end, &wg }) catch {
+                // If spawn fails, we'll handle this chunk on main thread
+                wg.finish();
+                break;
+            };
 
+            threads_spawned += 1;
             chunk_start = chunk_end;
         }
 
-        // Wait for all work to complete
-        self.pool.waitAndWork(&wg);
+        // Main thread handles remaining work
+        if (chunk_start < end) {
+            func(context, chunk_start, end);
+        }
+
+        // Wait for all spawned threads
+        wg.wait();
     }
 
     /// Get the number of threads in the pool.
@@ -131,26 +139,41 @@ pub const ThreadPool = struct {
         }
 
         // Divide batches among threads
-        const batches_per_thread = (batch_size + self.thread_count - 1) / self.thread_count;
+        const threads_to_use = @min(batch_size, self.thread_count);
+        const batches_per_thread = (batch_size + threads_to_use - 1) / threads_to_use;
 
         var wg: std.Thread.WaitGroup = .{};
         var batch_start: usize = 0;
+        var threads_spawned: u32 = 0;
 
-        while (batch_start < batch_size) {
+        while (batch_start < batch_size and threads_spawned < threads_to_use - 1) {
             const batch_end = @min(batch_start + batches_per_thread, batch_size);
-            const bs = batch_start;
-            const be = batch_end;
 
-            self.pool.spawnWg(&wg, struct {
-                fn work(ctx: @TypeOf(context), s: usize, e: usize) void {
-                    func(ctx, s, e);
+            const spawn_config: std.Thread.SpawnConfig = .{
+                .stack_size = self.stack_size,
+            };
+
+            wg.start();
+            _ = std.Thread.spawn(spawn_config, struct {
+                fn work(ctx: @TypeOf(context), bs: usize, be: usize, wait_group: *std.Thread.WaitGroup) void {
+                    defer wait_group.finish();
+                    func(ctx, bs, be);
                 }
-            }.work, .{ context, bs, be });
+            }.work, .{ context, batch_start, batch_end, &wg }) catch {
+                wg.finish();
+                break;
+            };
 
+            threads_spawned += 1;
             batch_start = batch_end;
         }
 
-        self.pool.waitAndWork(&wg);
+        // Main thread handles remaining work
+        if (batch_start < batch_size) {
+            func(context, batch_start, batch_size);
+        }
+
+        wg.wait();
     }
 };
 
