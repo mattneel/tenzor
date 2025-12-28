@@ -36,11 +36,8 @@ test "tokenizer parity with HuggingFace" {
     var tokenizer = Tokenizer.init(allocator);
     defer tokenizer.deinit();
 
-    // Load vocab
-    tokenizer.loadVocab("models/arctic-embed-xs/vocab.txt") catch |err| {
-        std.debug.print("Skipping parity test: vocab.txt not found ({s})\n", .{@errorName(err)});
-        return;
-    };
+    // Load vocab (skip test silently if not available)
+    tokenizer.loadVocab("models/arctic-embed-xs/vocab.txt") catch return;
 
     var output: [512]u32 = undefined;
 
