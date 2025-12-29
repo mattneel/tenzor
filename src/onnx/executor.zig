@@ -1562,7 +1562,288 @@ pub const Executor = struct {
             return;
         }
 
-        // TODO: Handle other dimension combinations (broadcasting, etc.)
+        // 2D x 3D broadcast: [M, K] @ [B, K, N] -> [B, M, N]
+        if (a_shape.len == 2 and b_shape.len == 3) {
+            const batch: usize = @intCast(b_shape[0]);
+            const m: usize = @intCast(a_shape[0]);
+            const k: usize = @intCast(a_shape[1]);
+            const n: usize = @intCast(b_shape[2]);
+
+            if (k != @as(usize, @intCast(b_shape[1]))) return error.ShapeMismatch;
+
+            const out_shape = [_]i64{ @intCast(batch), @intCast(m), @intCast(n) };
+            var output = try RuntimeTensor.alloc(self.allocator, a.dtype, &out_shape);
+            errdefer output.deinit();
+
+            switch (a.dtype) {
+                .f32 => {
+                    const a_data = a.asConstSlice(f32).?;
+                    const b_data = b.asConstSlice(f32).?;
+                    const out_data = output.asSlice(f32).?;
+                    for (0..batch) |bi| {
+                        const b_batch = b_data[bi * k * n ..][0 .. k * n];
+                        const out_batch = out_data[bi * m * n ..][0 .. m * n];
+                        kernels.matmul.matmulTiled(f32, a_data, b_batch, out_batch, m, k, n);
+                    }
+                },
+                .f64 => {
+                    const a_data = a.asConstSlice(f64).?;
+                    const b_data = b.asConstSlice(f64).?;
+                    const out_data = output.asSlice(f64).?;
+                    for (0..batch) |bi| {
+                        const b_batch = b_data[bi * k * n ..][0 .. k * n];
+                        const out_batch = out_data[bi * m * n ..][0 .. m * n];
+                        kernels.matmul.matmulTiled(f64, a_data, b_batch, out_batch, m, k, n);
+                    }
+                },
+                else => return error.UnsupportedDType,
+            }
+
+            if (self.buffers[output_idx]) |*existing| {
+                existing.deinit();
+            }
+            self.buffers[output_idx] = output;
+            return;
+        }
+
+        // 4D batched: [B1, B2, M, K] @ [B1, B2, K, N] -> [B1, B2, M, N]
+        if (a_shape.len == 4 and b_shape.len == 4) {
+            const b1: usize = @intCast(a_shape[0]);
+            const b2: usize = @intCast(a_shape[1]);
+            const m: usize = @intCast(a_shape[2]);
+            const k: usize = @intCast(a_shape[3]);
+            const n: usize = @intCast(b_shape[3]);
+
+            if (b1 != @as(usize, @intCast(b_shape[0]))) return error.ShapeMismatch;
+            if (b2 != @as(usize, @intCast(b_shape[1]))) return error.ShapeMismatch;
+            if (k != @as(usize, @intCast(b_shape[2]))) return error.ShapeMismatch;
+
+            const out_shape = [_]i64{ @intCast(b1), @intCast(b2), @intCast(m), @intCast(n) };
+            var output = try RuntimeTensor.alloc(self.allocator, a.dtype, &out_shape);
+            errdefer output.deinit();
+
+            switch (a.dtype) {
+                .f32 => {
+                    const a_data = a.asConstSlice(f32).?;
+                    const b_data = b.asConstSlice(f32).?;
+                    const out_data = output.asSlice(f32).?;
+                    for (0..b1) |bi1| {
+                        for (0..b2) |bi2| {
+                            const batch_idx = bi1 * b2 + bi2;
+                            const a_batch = a_data[batch_idx * m * k ..][0 .. m * k];
+                            const b_batch = b_data[batch_idx * k * n ..][0 .. k * n];
+                            const out_batch = out_data[batch_idx * m * n ..][0 .. m * n];
+                            kernels.matmul.matmulTiled(f32, a_batch, b_batch, out_batch, m, k, n);
+                        }
+                    }
+                },
+                .f64 => {
+                    const a_data = a.asConstSlice(f64).?;
+                    const b_data = b.asConstSlice(f64).?;
+                    const out_data = output.asSlice(f64).?;
+                    for (0..b1) |bi1| {
+                        for (0..b2) |bi2| {
+                            const batch_idx = bi1 * b2 + bi2;
+                            const a_batch = a_data[batch_idx * m * k ..][0 .. m * k];
+                            const b_batch = b_data[batch_idx * k * n ..][0 .. k * n];
+                            const out_batch = out_data[batch_idx * m * n ..][0 .. m * n];
+                            kernels.matmul.matmulTiled(f64, a_batch, b_batch, out_batch, m, k, n);
+                        }
+                    }
+                },
+                else => return error.UnsupportedDType,
+            }
+
+            if (self.buffers[output_idx]) |*existing| {
+                existing.deinit();
+            }
+            self.buffers[output_idx] = output;
+            return;
+        }
+
+        // 4D x 2D broadcast: [B1, B2, M, K] @ [K, N] -> [B1, B2, M, N]
+        if (a_shape.len == 4 and b_shape.len == 2) {
+            const b1: usize = @intCast(a_shape[0]);
+            const b2: usize = @intCast(a_shape[1]);
+            const m: usize = @intCast(a_shape[2]);
+            const k: usize = @intCast(a_shape[3]);
+            const n: usize = @intCast(b_shape[1]);
+
+            if (k != @as(usize, @intCast(b_shape[0]))) return error.ShapeMismatch;
+
+            const out_shape = [_]i64{ @intCast(b1), @intCast(b2), @intCast(m), @intCast(n) };
+            var output = try RuntimeTensor.alloc(self.allocator, a.dtype, &out_shape);
+            errdefer output.deinit();
+
+            switch (a.dtype) {
+                .f32 => {
+                    const a_data = a.asConstSlice(f32).?;
+                    const b_data = b.asConstSlice(f32).?;
+                    const out_data = output.asSlice(f32).?;
+                    for (0..b1) |bi1| {
+                        for (0..b2) |bi2| {
+                            const batch_idx = bi1 * b2 + bi2;
+                            const a_batch = a_data[batch_idx * m * k ..][0 .. m * k];
+                            const out_batch = out_data[batch_idx * m * n ..][0 .. m * n];
+                            kernels.matmul.matmulTiled(f32, a_batch, b_data, out_batch, m, k, n);
+                        }
+                    }
+                },
+                .f64 => {
+                    const a_data = a.asConstSlice(f64).?;
+                    const b_data = b.asConstSlice(f64).?;
+                    const out_data = output.asSlice(f64).?;
+                    for (0..b1) |bi1| {
+                        for (0..b2) |bi2| {
+                            const batch_idx = bi1 * b2 + bi2;
+                            const a_batch = a_data[batch_idx * m * k ..][0 .. m * k];
+                            const out_batch = out_data[batch_idx * m * n ..][0 .. m * n];
+                            kernels.matmul.matmulTiled(f64, a_batch, b_data, out_batch, m, k, n);
+                        }
+                    }
+                },
+                else => return error.UnsupportedDType,
+            }
+
+            if (self.buffers[output_idx]) |*existing| {
+                existing.deinit();
+            }
+            self.buffers[output_idx] = output;
+            return;
+        }
+
+        // 1D x 2D: [K] @ [K, N] -> [N]
+        if (a_shape.len == 1 and b_shape.len == 2) {
+            const k: usize = @intCast(a_shape[0]);
+            const n: usize = @intCast(b_shape[1]);
+
+            if (k != @as(usize, @intCast(b_shape[0]))) return error.ShapeMismatch;
+
+            const out_shape = [_]i64{@intCast(n)};
+            var output = try RuntimeTensor.alloc(self.allocator, a.dtype, &out_shape);
+            errdefer output.deinit();
+
+            switch (a.dtype) {
+                .f32 => {
+                    const a_data = a.asConstSlice(f32).?;
+                    const b_data = b.asConstSlice(f32).?;
+                    const out_data = output.asSlice(f32).?;
+                    // Vector-matrix: treat as [1, K] @ [K, N] -> [1, N], then squeeze
+                    for (0..n) |j| {
+                        var sum: f32 = 0;
+                        for (0..k) |ki| {
+                            sum += a_data[ki] * b_data[ki * n + j];
+                        }
+                        out_data[j] = sum;
+                    }
+                },
+                else => return error.UnsupportedDType,
+            }
+
+            if (self.buffers[output_idx]) |*existing| {
+                existing.deinit();
+            }
+            self.buffers[output_idx] = output;
+            return;
+        }
+
+        // 2D x 1D: [M, K] @ [K] -> [M]
+        if (a_shape.len == 2 and b_shape.len == 1) {
+            const m: usize = @intCast(a_shape[0]);
+            const k: usize = @intCast(a_shape[1]);
+
+            if (k != @as(usize, @intCast(b_shape[0]))) return error.ShapeMismatch;
+
+            const out_shape = [_]i64{@intCast(m)};
+            var output = try RuntimeTensor.alloc(self.allocator, a.dtype, &out_shape);
+            errdefer output.deinit();
+
+            switch (a.dtype) {
+                .f32 => {
+                    const a_data = a.asConstSlice(f32).?;
+                    const b_data = b.asConstSlice(f32).?;
+                    const out_data = output.asSlice(f32).?;
+                    for (0..m) |i| {
+                        var sum: f32 = 0;
+                        for (0..k) |ki| {
+                            sum += a_data[i * k + ki] * b_data[ki];
+                        }
+                        out_data[i] = sum;
+                    }
+                },
+                else => return error.UnsupportedDType,
+            }
+
+            if (self.buffers[output_idx]) |*existing| {
+                existing.deinit();
+            }
+            self.buffers[output_idx] = output;
+            return;
+        }
+
+        // Fallback: try to handle as general N-D matmul by treating as 2D
+        // This handles cases like [1, 1, M, K] @ [1, 1, K, N] by flattening batch dims
+        if (a_shape.len >= 2 and b_shape.len >= 2) {
+            const a_m: usize = @intCast(a_shape[a_shape.len - 2]);
+            const a_k: usize = @intCast(a_shape[a_shape.len - 1]);
+            const b_k: usize = @intCast(b_shape[b_shape.len - 2]);
+            const b_n: usize = @intCast(b_shape[b_shape.len - 1]);
+
+            if (a_k != b_k) return error.ShapeMismatch;
+
+            // Calculate batch size
+            var a_batch: usize = 1;
+            for (a_shape[0 .. a_shape.len - 2]) |d| a_batch *= @intCast(d);
+            var b_batch: usize = 1;
+            for (b_shape[0 .. b_shape.len - 2]) |d| b_batch *= @intCast(d);
+
+            const batch = @max(a_batch, b_batch);
+            const m = a_m;
+            const k = a_k;
+            const n = b_n;
+
+            // Build output shape
+            var out_shape_buf: [8]i64 = undefined;
+            const max_batch_dims = @max(a_shape.len, b_shape.len) - 2;
+            for (0..max_batch_dims) |i| {
+                const a_idx = if (i < a_shape.len - 2) i else null;
+                const b_idx = if (i < b_shape.len - 2) i else null;
+                const a_dim: i64 = if (a_idx) |idx| a_shape[idx] else 1;
+                const b_dim: i64 = if (b_idx) |idx| b_shape[idx] else 1;
+                out_shape_buf[i] = @max(a_dim, b_dim);
+            }
+            out_shape_buf[max_batch_dims] = @intCast(m);
+            out_shape_buf[max_batch_dims + 1] = @intCast(n);
+            const out_ndim = max_batch_dims + 2;
+
+            var output = try RuntimeTensor.alloc(self.allocator, a.dtype, out_shape_buf[0..out_ndim]);
+            errdefer output.deinit();
+
+            switch (a.dtype) {
+                .f32 => {
+                    const a_data = a.asConstSlice(f32).?;
+                    const b_data = b.asConstSlice(f32).?;
+                    const out_data = output.asSlice(f32).?;
+
+                    for (0..batch) |bi| {
+                        const a_bi = if (a_batch == 1) 0 else bi;
+                        const b_bi = if (b_batch == 1) 0 else bi;
+                        const a_batch_data = a_data[a_bi * m * k ..][0 .. m * k];
+                        const b_batch_data = b_data[b_bi * k * n ..][0 .. k * n];
+                        const out_batch_data = out_data[bi * m * n ..][0 .. m * n];
+                        kernels.matmul.matmulTiled(f32, a_batch_data, b_batch_data, out_batch_data, m, k, n);
+                    }
+                },
+                else => return error.UnsupportedDType,
+            }
+
+            if (self.buffers[output_idx]) |*existing| {
+                existing.deinit();
+            }
+            self.buffers[output_idx] = output;
+            return;
+        }
+
         return error.UnsupportedShape;
     }
 
@@ -1759,13 +2040,44 @@ pub const Executor = struct {
                             row_offset += chunk_size;
                         }
                     }
-                } else {
-                    // General case: concat along axis 0
+                } else if (actual_axis == 0) {
+                    // Concat along axis 0 - simple copy
                     for (node.inputs) |input_idx| {
                         const input = self.buffers[input_idx].?;
                         const src = input.asConstSlice(T).?;
                         @memcpy(dst[offset .. offset + src.len], src);
                         offset += src.len;
+                    }
+                } else {
+                    // General case: concat along middle axis
+                    // Calculate sizes before, at, and after the concat axis
+                    var pre_size: usize = 1;
+                    for (0..actual_axis) |i| {
+                        pre_size *= @intCast(first.shape[i]);
+                    }
+                    var post_size: usize = 1;
+                    for (actual_axis + 1..ndim) |i| {
+                        post_size *= @intCast(first.shape[i]);
+                    }
+
+                    // Total output axis size
+                    const total_axis: usize = @intCast(concat_dim);
+                    _ = total_axis;
+
+                    for (0..pre_size) |pre| {
+                        var axis_offset: usize = 0;
+                        for (node.inputs) |input_idx| {
+                            const input = self.buffers[input_idx].?;
+                            const src = input.asConstSlice(T).?;
+                            const input_axis_size: usize = @intCast(input.shape[actual_axis]);
+
+                            for (0..input_axis_size) |ax| {
+                                const src_idx = (pre * input_axis_size + ax) * post_size;
+                                const dst_idx = (pre * @as(usize, @intCast(concat_dim)) + axis_offset + ax) * post_size;
+                                @memcpy(dst[dst_idx..][0..post_size], src[src_idx..][0..post_size]);
+                            }
+                            axis_offset += input_axis_size;
+                        }
                     }
                 }
             },
