@@ -8,6 +8,47 @@
 //! Not yet suitable for production use.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// Debug assertions for catching bugs during development
+const debug = struct {
+    /// Assert tensor shape is valid (all dimensions positive, product matches numel)
+    fn assertValidTensor(tensor: RuntimeTensor) void {
+        if (builtin.mode == .Debug) {
+            var expected_numel: usize = 1;
+            for (tensor.shape) |dim| {
+                std.debug.assert(dim >= 0); // No negative dimensions
+                expected_numel *= @intCast(dim);
+            }
+            std.debug.assert(tensor.numel == expected_numel);
+            std.debug.assert(tensor.data.len >= tensor.numel * tensor.dtype.byteSize());
+        }
+    }
+
+    /// Assert axis is valid for given number of dimensions
+    fn assertValidAxis(axis: i64, ndim: usize) void {
+        if (builtin.mode == .Debug) {
+            const ndim_i64: i64 = @intCast(ndim);
+            std.debug.assert(axis >= -ndim_i64 and axis < ndim_i64);
+        }
+    }
+
+    /// Assert index is within bounds
+    fn assertInBounds(index: usize, len: usize) void {
+        if (builtin.mode == .Debug) {
+            std.debug.assert(index < len);
+        }
+    }
+
+    /// Assert shapes are broadcastable
+    fn assertBroadcastable(lhs: []const i64, rhs: []const i64) void {
+        if (builtin.mode == .Debug) {
+            var out_buf: [8]i64 = undefined;
+            const result = Executor.computeBroadcastShape(lhs, rhs, &out_buf);
+            std.debug.assert(result != null); // Shapes must be broadcastable
+        }
+    }
+};
 const Allocator = std.mem.Allocator;
 const graph_mod = @import("graph.zig");
 const Graph = graph_mod.Graph;
@@ -975,6 +1016,7 @@ pub const Executor = struct {
         if (node.inputs.len < 1 or node.outputs.len < 1) return error.InvalidNode;
 
         const input = self.buffers[node.inputs[0]] orelse return error.MissingInput;
+        debug.assertValidTensor(input);
         const output_idx = node.outputs[0];
 
         // Allocate output with same shape
@@ -1043,6 +1085,8 @@ pub const Executor = struct {
 
         const lhs = self.buffers[node.inputs[0]] orelse return error.MissingInput;
         const rhs = self.buffers[node.inputs[1]] orelse return error.MissingInput;
+        debug.assertValidTensor(lhs);
+        debug.assertValidTensor(rhs);
         const output_idx = node.outputs[0];
 
         // Compute broadcast output shape
@@ -3427,10 +3471,15 @@ pub const Executor = struct {
                 new_shape[i] = 1;
                 ax_idx += 1;
             } else {
+                // Assert we won't access out of bounds
+                debug.assertInBounds(in_idx, input.shape.len);
                 new_shape[i] = input.shape[in_idx];
                 in_idx += 1;
             }
         }
+
+        // Verify we consumed all input dimensions
+        std.debug.assert(in_idx == input.shape.len);
 
         // Create output sharing data with input (just a view with different shape)
         const shape_slice = try self.allocator.dupe(i64, new_shape[0..new_ndim]);
@@ -3443,6 +3492,8 @@ pub const Executor = struct {
             .owns_data = false, // Shared with input
         };
 
+        debug.assertValidTensor(output);
+
         if (self.buffers[output_idx]) |*existing| existing.deinit();
         self.buffers[output_idx] = output;
     }
@@ -3452,6 +3503,7 @@ pub const Executor = struct {
         if (node.inputs.len < 1 or node.outputs.len < 1) return error.InvalidNode;
 
         const input = self.buffers[node.inputs[0]] orelse return error.MissingInput;
+        debug.assertValidTensor(input);
         const output_idx = node.outputs[0];
 
         // Get axes to squeeze (if not specified, squeeze all size-1 dims)
