@@ -87,4 +87,5 @@ test {
     _ = graph;
     _ = builder;
     _ = executor;
+    _ = @import("test_real_model.zig");
 }

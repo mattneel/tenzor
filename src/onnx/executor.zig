@@ -991,6 +991,7 @@ pub const Executor = struct {
             .Not => try self.execNot(node),
             .ReduceMean => try self.execReduceMean(node),
             .ReduceMax => try self.execReduceMax(node),
+            .ReduceProd => try self.execReduceProd(node),
             .ReduceL2 => try self.execReduceL2(node),
             .Tile => try self.execTile(node),
             .Gemm => try self.execGemm(node),
@@ -2722,10 +2723,19 @@ pub const Executor = struct {
         // Get condition as bool (stored as u8)
         const cond_data = condition.asConstSlice(u8) orelse return error.UnsupportedDType;
 
-        // Determine output shape (broadcast)
-        // For simplicity, require condition shape matches or is broadcastable
-        const out_shape = if (x.numel >= y.numel) x.shape else y.shape;
-        const out_numel = if (x.numel >= y.numel) x.numel else y.numel;
+        // Determine output shape by broadcasting all three inputs (condition, x, y)
+        var temp_shape_buf: [8]i64 = undefined;
+        const xy_shape = computeBroadcastShape(x.shape, y.shape, &temp_shape_buf) orelse
+            return error.ShapeMismatch;
+
+        var out_shape_buf: [8]i64 = undefined;
+        const out_shape = computeBroadcastShape(condition.shape, xy_shape, &out_shape_buf) orelse
+            return error.ShapeMismatch;
+
+        var out_numel: usize = 1;
+        for (out_shape) |dim| {
+            out_numel *= @intCast(dim);
+        }
 
         var output = try RuntimeTensor.alloc(self.allocator, x.dtype, out_shape);
         errdefer output.deinit();
@@ -3084,6 +3094,167 @@ pub const Executor = struct {
                     }
 
                     out_data[out_flat_idx] += in_data[flat_idx];
+                }
+            },
+            else => return error.UnsupportedDType,
+        }
+
+        if (self.buffers[output_idx]) |*existing| {
+            existing.deinit();
+        }
+        self.buffers[output_idx] = output;
+    }
+
+    /// Execute ReduceProd operation
+    fn execReduceProd(self: *Executor, node: Node) !void {
+        if (node.inputs.len < 1 or node.outputs.len < 1) return error.InvalidNode;
+
+        const input = self.buffers[node.inputs[0]] orelse return error.MissingInput;
+        const output_idx = node.outputs[0];
+
+        // Get reduce attributes (if present)
+        const has_reduce_attrs = node.attributes == .reduce;
+        const keepdims = if (has_reduce_attrs) node.attributes.reduce.keepdims else true;
+        const noop_with_empty_axes = if (has_reduce_attrs) node.attributes.reduce.noop_with_empty_axes else false;
+
+        // Get axes from attributes or second input (ONNX opset 13+)
+        var axes_to_reduce: []const i64 = if (has_reduce_attrs)
+            node.attributes.reduce.axes orelse &.{}
+        else
+            &.{};
+
+        // Check for axes as second input (opset 13+)
+        var axes_from_input_buf: [8]i64 = undefined;
+        if (axes_to_reduce.len == 0 and node.inputs.len > 1) {
+            if (self.buffers[node.inputs[1]]) |axes_tensor| {
+                if (axes_tensor.dtype == .i64) {
+                    const axes_data = axes_tensor.asConstSlice(i64).?;
+                    const count = @min(axes_data.len, 8);
+                    @memcpy(axes_from_input_buf[0..count], axes_data[0..count]);
+                    axes_to_reduce = axes_from_input_buf[0..count];
+                }
+            }
+        }
+
+        // If axes empty and noop_with_empty_axes, just copy input
+        if (axes_to_reduce.len == 0 and noop_with_empty_axes) {
+            var output = try RuntimeTensor.alloc(self.allocator, input.dtype, input.shape);
+            @memcpy(output.data, input.data);
+            if (self.buffers[output_idx]) |*existing| {
+                existing.deinit();
+            }
+            self.buffers[output_idx] = output;
+            return;
+        }
+
+        // If axes empty, reduce all dimensions
+        var all_axes_buf: [8]i64 = undefined;
+        if (axes_to_reduce.len == 0) {
+            for (0..input.shape.len) |i| {
+                all_axes_buf[i] = @intCast(i);
+            }
+            axes_to_reduce = all_axes_buf[0..input.shape.len];
+        }
+
+        // Normalize negative axes
+        var norm_axes_buf: [8]usize = undefined;
+        for (axes_to_reduce, 0..) |ax, i| {
+            const norm: usize = if (ax < 0)
+                @intCast(@as(i64, @intCast(input.shape.len)) + ax)
+            else
+                @intCast(ax);
+            norm_axes_buf[i] = norm;
+        }
+        const norm_axes = norm_axes_buf[0..axes_to_reduce.len];
+
+        // Compute output shape
+        var out_shape_buf: [8]i64 = undefined;
+        var out_ndim: usize = 0;
+        for (input.shape, 0..) |dim, i| {
+            var is_reduced = false;
+            for (norm_axes) |ax| {
+                if (ax == i) {
+                    is_reduced = true;
+                    break;
+                }
+            }
+            if (is_reduced) {
+                if (keepdims) {
+                    out_shape_buf[out_ndim] = 1;
+                    out_ndim += 1;
+                }
+            } else {
+                out_shape_buf[out_ndim] = dim;
+                out_ndim += 1;
+            }
+        }
+
+        var output = try RuntimeTensor.alloc(self.allocator, input.dtype, out_shape_buf[0..out_ndim]);
+        errdefer output.deinit();
+
+        // Compute strides for input
+        var in_strides: [8]usize = undefined;
+        {
+            var stride: usize = 1;
+            var i = input.shape.len;
+            while (i > 0) {
+                i -= 1;
+                in_strides[i] = stride;
+                stride *= @intCast(input.shape[i]);
+            }
+        }
+
+        // Compute strides for output
+        var out_strides: [8]usize = undefined;
+        {
+            var stride: usize = 1;
+            var i = out_ndim;
+            while (i > 0) {
+                i -= 1;
+                out_strides[i] = stride;
+                stride *= @intCast(out_shape_buf[i]);
+            }
+        }
+
+        // Product reduction - initialize to 1 and multiply
+        switch (input.dtype) {
+            inline .f32, .f64, .f16, .i32, .i64 => |dtype| {
+                const T = dtype.ZigType();
+                const in_data = input.asConstSlice(T).?;
+                const out_data = output.asSlice(T).?;
+
+                // Initialize to 1 (multiplicative identity)
+                for (out_data) |*v| {
+                    v.* = 1;
+                }
+
+                // Iterate over input and multiply
+                for (0..input.numel) |flat_idx| {
+                    // Compute multi-index for input
+                    var remaining = flat_idx;
+                    var out_flat_idx: usize = 0;
+                    var out_dim_idx: usize = 0;
+
+                    for (0..input.shape.len) |d| {
+                        const idx = remaining / in_strides[d];
+                        remaining = remaining % in_strides[d];
+
+                        var is_reduced = false;
+                        for (norm_axes) |ax| {
+                            if (ax == d) {
+                                is_reduced = true;
+                                break;
+                            }
+                        }
+
+                        if (!is_reduced or keepdims) {
+                            const out_idx = if (is_reduced) 0 else idx;
+                            out_flat_idx += out_idx * out_strides[out_dim_idx];
+                            out_dim_idx += 1;
+                        }
+                    }
+
+                    out_data[out_flat_idx] *= in_data[flat_idx];
                 }
             },
             else => return error.UnsupportedDType,
@@ -4666,15 +4837,28 @@ pub const Executor = struct {
         }
         defer if (bias_f32_buf) |buf| self.allocator.free(buf);
 
-        // Check dimensionality (support 1D and 2D)
+        // Check dimensionality (support 1D and 2D convolutions, requiring 3D or 4D input)
         const spatial_dims = x.shape.len - 2;
         if (spatial_dims != 1 and spatial_dims != 2) {
-            return error.UnsupportedDType; // Only 1D and 2D supported for now
+            std.debug.print("Conv requires 3D or 4D input, got {}D input with shape {any}\n", .{ x.shape.len, x.shape });
+            return error.InvalidShape;
         }
 
         const batch: usize = @intCast(x.shape[0]);
         const in_channels: usize = @intCast(x.shape[1]);
         const out_channels: usize = @intCast(w.shape[0]);
+        const weight_in_channels: usize = @intCast(w.shape[1]);
+
+        // Validate channel dimensions match (input_channels == weight_in_channels * groups)
+        if (in_channels != weight_in_channels * group) {
+            std.debug.print("Conv channel mismatch: input has {} channels but weight expects {} * {} = {}\n", .{
+                in_channels,
+                weight_in_channels,
+                group,
+                weight_in_channels * group,
+            });
+            return error.InvalidShape;
+        }
 
         // Get strides, pads, dilations (defaults to 1s and 0s)
         const default_ones = [_]i64{ 1, 1 };
@@ -5074,6 +5258,10 @@ pub const Executor = struct {
         const input = self.buffers[node.inputs[0]] orelse return error.MissingInput;
         const output_idx = node.outputs[0];
 
+        // Support both 3D (1D pooling) and 4D (2D pooling)
+        if (input.shape.len == 3) {
+            return self.execAveragePool1D(node, input, output_idx);
+        }
         if (input.shape.len != 4) return error.InvalidShape;
 
         const batch: usize = @intCast(input.shape[0]);
@@ -5154,6 +5342,73 @@ pub const Executor = struct {
             }
         } else {
             return error.UnsupportedDType;
+        }
+
+        if (self.buffers[output_idx]) |*existing| existing.deinit();
+        self.buffers[output_idx] = output;
+    }
+
+    /// Execute 1D Average Pool (for 3D input: [batch, channels, length])
+    fn execAveragePool1D(self: *Executor, node: Node, input: RuntimeTensor, output_idx: u32) !void {
+        const batch: usize = @intCast(input.shape[0]);
+        const channels: usize = @intCast(input.shape[1]);
+        const in_length: usize = @intCast(input.shape[2]);
+
+        const attrs = node.attributes.pool;
+        const default_kernel = [_]i64{2};
+        const default_stride = [_]i64{1};
+        const default_pads = [_]i64{ 0, 0 };
+
+        const kernel_shape = attrs.kernel_shape orelse &default_kernel;
+        const strides_attr = attrs.strides orelse &default_stride;
+        const pads = attrs.pads orelse &default_pads;
+
+        const kernel_size: usize = @intCast(kernel_shape[0]);
+        const stride: usize = @intCast(strides_attr[0]);
+        const pad_start: usize = @intCast(pads[0]);
+        const pad_end: usize = if (pads.len > 1) @intCast(pads[1]) else pad_start;
+        const count_include_pad = attrs.count_include_pad;
+
+        const padded_length = in_length + pad_start + pad_end;
+        const out_length = if (padded_length >= kernel_size) (padded_length - kernel_size) / stride + 1 else 0;
+
+        const out_shape = [_]i64{
+            @intCast(batch),
+            @intCast(channels),
+            @intCast(out_length),
+        };
+
+        var output = try RuntimeTensor.alloc(self.allocator, input.dtype, &out_shape);
+        errdefer output.deinit();
+
+        if (input.asConstSlice(f32)) |in_data| {
+            const out_data = output.asSlice(f32).?;
+
+            for (0..batch) |b| {
+                for (0..channels) |c| {
+                    for (0..out_length) |ol| {
+                        var sum: f32 = 0;
+                        var count: usize = 0;
+                        const in_start = ol * stride;
+
+                        for (0..kernel_size) |k| {
+                            const pos_signed: i64 = @as(i64, @intCast(in_start + k)) - @as(i64, @intCast(pad_start));
+
+                            if (pos_signed >= 0 and pos_signed < @as(i64, @intCast(in_length))) {
+                                const pos: usize = @intCast(pos_signed);
+                                const idx = (b * channels + c) * in_length + pos;
+                                sum += in_data[idx];
+                                count += 1;
+                            } else if (count_include_pad) {
+                                count += 1;
+                            }
+                        }
+
+                        const out_idx = (b * channels + c) * out_length + ol;
+                        out_data[out_idx] = if (count > 0) sum / @as(f32, @floatFromInt(count)) else 0;
+                    }
+                }
+            }
         }
 
         if (self.buffers[output_idx]) |*existing| existing.deinit();

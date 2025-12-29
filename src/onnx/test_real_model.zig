@@ -144,6 +144,44 @@ test "build runtime graph from embed_tokens.onnx" {
     try std.testing.expect(graph.nodes.items.len > 0);
 }
 
+test "run speech_encoder_q4.onnx" {
+    const allocator = std.testing.allocator;
+
+    const data = readFile(allocator, "/home/autark/models/chatterbox/onnx/speech_encoder_q4.onnx") catch |err| {
+        std.debug.print("Skipping test: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(data);
+
+    var graph = try root.buildFromBytes(allocator, data);
+    defer graph.deinit();
+
+    std.debug.print("\nSpeech encoder: {} nodes, {} inputs\n", .{ graph.nodes.items.len, graph.inputs.len });
+
+    var exec = try root.Executor.init(allocator, &graph);
+    defer exec.deinit();
+
+    try exec.loadWeights();
+    try exec.loadExternalWeights("/home/autark/models/chatterbox/onnx");
+
+    // Set input: audio [batch=1, time=16000]
+    const input_data = try allocator.alloc(f32, 16000);
+    defer allocator.free(input_data);
+    @memset(input_data, 0.1);
+
+    const input_name = graph.tensors.items[graph.inputs[0]].name;
+    const input_shape = [_]i64{ 1, 16000 };
+    try exec.setInputFromSlice(input_name, f32, input_data, &input_shape);
+
+    // Run
+    exec.run() catch |err| {
+        std.debug.print("Execution failed: {}\n", .{err});
+        return err;
+    };
+
+    std.debug.print("Speech encoder completed!\n", .{});
+}
+
 test "execute embed_tokens.onnx (external weights)" {
     const allocator = std.testing.allocator;
 
