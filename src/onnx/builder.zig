@@ -223,12 +223,16 @@ fn parseAttributes(allocator: Allocator, op_type: OpType, attrs: []const types.A
         .Gather => .{ .gather = parseAxisAttr(attrs, 0) },   // ONNX default: axis=0
         .Squeeze => .{ .squeeze = parseAxesAttr(attrs) },
         .Unsqueeze => .{ .unsqueeze = parseAxesAttr(attrs) },
-        .ReduceSum, .ReduceMean, .ReduceMax, .ReduceMin => .{ .reduce = parseReduceAttrs(attrs) },
+        .ReduceSum, .ReduceMean, .ReduceMax, .ReduceMin, .ReduceL2 => .{ .reduce = parseReduceAttrs(attrs) },
         .Conv, .ConvTranspose => .{ .conv = parseConvAttrs(attrs) },
         .Cast => .{ .cast = parseCastAttrs(attrs) orelse return BuildError.MissingAttribute },
         .Constant => .{ .constant = try parseConstantAttrs(allocator, attrs) },
         .MatMulNBits => .{ .matmul_nbits = parseMatMulNBitsAttrs(attrs) },
         .GatherBlockQuantized => .{ .gather_block_quantized = parseGatherBlockQuantizedAttrs(attrs) },
+        .MaxPool, .AveragePool => .{ .pool = try parsePoolAttrs(allocator, attrs) },
+        .BatchNormalization => .{ .batch_norm = parseBatchNormAttrs(attrs) },
+        .Flatten => .{ .flatten = parseFlattenAttrs(attrs) },
+        .Split => .{ .split = try parseSplitAttrs(allocator, attrs) },
         else => .none,
     };
 }
@@ -358,6 +362,76 @@ fn parseConvAttrs(attrs: []const types.AttributeProto) Node.Attributes.ConvAttrs
             result.group = attr.i orelse 1;
         } else if (std.mem.eql(u8, name, "auto_pad")) {
             result.auto_pad = attr.s orelse "NOTSET";
+        }
+    }
+    return result;
+}
+
+fn parsePoolAttrs(allocator: Allocator, attrs: []const types.AttributeProto) BuildError!Node.Attributes.PoolAttrs {
+    var result: Node.Attributes.PoolAttrs = .{};
+    for (attrs) |attr| {
+        const name = attr.name orelse "";
+        if (std.mem.eql(u8, name, "kernel_shape")) {
+            if (attr.attr_type == .ints and attr.ints.len > 0) {
+                result.kernel_shape = allocator.dupe(i64, attr.ints) catch return error.OutOfMemory;
+            }
+        } else if (std.mem.eql(u8, name, "strides")) {
+            if (attr.attr_type == .ints and attr.ints.len > 0) {
+                result.strides = allocator.dupe(i64, attr.ints) catch return error.OutOfMemory;
+            }
+        } else if (std.mem.eql(u8, name, "pads")) {
+            if (attr.attr_type == .ints and attr.ints.len > 0) {
+                result.pads = allocator.dupe(i64, attr.ints) catch return error.OutOfMemory;
+            }
+        } else if (std.mem.eql(u8, name, "auto_pad")) {
+            result.auto_pad = attr.s orelse "NOTSET";
+        } else if (std.mem.eql(u8, name, "ceil_mode")) {
+            result.ceil_mode = (attr.i orelse 0) != 0;
+        } else if (std.mem.eql(u8, name, "count_include_pad")) {
+            result.count_include_pad = (attr.i orelse 0) != 0;
+        }
+    }
+    return result;
+}
+
+fn parseBatchNormAttrs(attrs: []const types.AttributeProto) Node.Attributes.BatchNormAttrs {
+    var result: Node.Attributes.BatchNormAttrs = .{};
+    for (attrs) |attr| {
+        const name = attr.name orelse "";
+        if (std.mem.eql(u8, name, "epsilon")) {
+            result.epsilon = attr.f orelse 1e-5;
+        } else if (std.mem.eql(u8, name, "momentum")) {
+            result.momentum = attr.f orelse 0.9;
+        } else if (std.mem.eql(u8, name, "training_mode")) {
+            result.training_mode = (attr.i orelse 0) != 0;
+        }
+    }
+    return result;
+}
+
+fn parseFlattenAttrs(attrs: []const types.AttributeProto) Node.Attributes.FlattenAttrs {
+    var result: Node.Attributes.FlattenAttrs = .{};
+    for (attrs) |attr| {
+        const name = attr.name orelse "";
+        if (std.mem.eql(u8, name, "axis")) {
+            result.axis = attr.i orelse 1;
+        }
+    }
+    return result;
+}
+
+fn parseSplitAttrs(allocator: Allocator, attrs: []const types.AttributeProto) BuildError!Node.Attributes.SplitAttrs {
+    var result: Node.Attributes.SplitAttrs = .{};
+    for (attrs) |attr| {
+        const name = attr.name orelse "";
+        if (std.mem.eql(u8, name, "axis")) {
+            result.axis = attr.i orelse 0;
+        } else if (std.mem.eql(u8, name, "split")) {
+            if (attr.attr_type == .ints and attr.ints.len > 0) {
+                result.split = allocator.dupe(i64, attr.ints) catch return error.OutOfMemory;
+            }
+        } else if (std.mem.eql(u8, name, "num_outputs")) {
+            result.num_outputs = attr.i orelse 0;
         }
     }
     return result;

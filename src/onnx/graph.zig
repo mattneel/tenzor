@@ -331,6 +331,10 @@ pub const Node = struct {
         constant: ConstantAttrs,
         matmul_nbits: MatMulNBitsAttrs,
         gather_block_quantized: GatherBlockQuantizedAttrs,
+        pool: PoolAttrs,
+        batch_norm: BatchNormAttrs,
+        flatten: FlattenAttrs,
+        split: SplitAttrs,
 
         pub const GemmAttrs = struct {
             alpha: f32 = 1.0,
@@ -398,6 +402,31 @@ pub const Node = struct {
         pub const GatherBlockQuantizedAttrs = struct {
             block_size: i64 = 32,
             quantize_axis: i64 = 1,
+        };
+
+        pub const PoolAttrs = struct {
+            kernel_shape: ?[]const i64 = null,
+            strides: ?[]const i64 = null,
+            pads: ?[]const i64 = null,
+            auto_pad: []const u8 = "NOTSET",
+            ceil_mode: bool = false,
+            count_include_pad: bool = false,
+        };
+
+        pub const BatchNormAttrs = struct {
+            epsilon: f32 = 1e-5,
+            momentum: f32 = 0.9,
+            training_mode: bool = false,
+        };
+
+        pub const FlattenAttrs = struct {
+            axis: i64 = 1,
+        };
+
+        pub const SplitAttrs = struct {
+            axis: i64 = 0,
+            split: ?[]const i64 = null, // optional split sizes
+            num_outputs: i64 = 0,
         };
     };
 };

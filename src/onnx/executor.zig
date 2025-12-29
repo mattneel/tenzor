@@ -880,11 +880,19 @@ pub const Executor = struct {
             .Not => try self.execNot(node),
             .ReduceMean => try self.execReduceMean(node),
             .ReduceMax => try self.execReduceMax(node),
+            .ReduceL2 => try self.execReduceL2(node),
+            .Tile => try self.execTile(node),
             .Gemm => try self.execGemm(node),
             .Pad => try self.execPad(node),
             .STFT => try self.execSTFT(node),
             .Conv => try self.execConv(node),
             .NonZero => try self.execNonZero(node),
+            .MaxPool => try self.execMaxPool(node),
+            .AveragePool => try self.execAveragePool(node),
+            .GlobalAveragePool => try self.execGlobalAveragePool(node),
+            .BatchNormalization => try self.execBatchNorm(node),
+            .Flatten => try self.execFlatten(node),
+            .Split => try self.execSplit(node),
             else => {
                 std.debug.print("Unsupported op: {s}\n", .{node.op_type_str});
                 return error.UnsupportedOp;
@@ -940,6 +948,25 @@ pub const Executor = struct {
         self.buffers[output_idx] = output;
     }
 
+    /// Compute broadcast output shape for two tensors
+    /// Returns null if shapes are not broadcastable
+    fn computeBroadcastShape(lhs_shape: []const i64, rhs_shape: []const i64, out_buf: *[8]i64) ?[]i64 {
+        const max_ndim = @max(lhs_shape.len, rhs_shape.len);
+        if (max_ndim > 8) return null;
+
+        for (0..max_ndim) |i| {
+            const l_idx = if (i < lhs_shape.len) lhs_shape.len - 1 - i else null;
+            const r_idx = if (i < rhs_shape.len) rhs_shape.len - 1 - i else null;
+            const l_dim: i64 = if (l_idx) |idx| lhs_shape[idx] else 1;
+            const r_dim: i64 = if (r_idx) |idx| rhs_shape[idx] else 1;
+
+            // Dimensions must be equal or one must be 1
+            if (l_dim != r_dim and l_dim != 1 and r_dim != 1) return null;
+            out_buf[max_ndim - 1 - i] = @max(l_dim, r_dim);
+        }
+        return out_buf[0..max_ndim];
+    }
+
     /// Execute a binary elementwise operation
     fn execBinaryOp(self: *Executor, node: Node, comptime op: kernels.elementwise.OpTag) !void {
         if (node.inputs.len < 2 or node.outputs.len < 1) return error.InvalidNode;
@@ -948,19 +975,14 @@ pub const Executor = struct {
         const rhs = self.buffers[node.inputs[1]] orelse return error.MissingInput;
         const output_idx = node.outputs[0];
 
-        // Handle empty tensors - if either operand is empty, output is empty
+        // Compute broadcast output shape
+        var out_shape_buf: [8]i64 = undefined;
+        const out_shape = computeBroadcastShape(lhs.shape, rhs.shape, &out_shape_buf) orelse
+            return error.ShapeMismatch;
+
+        // Handle empty tensors
         if (lhs.numel == 0 or rhs.numel == 0) {
-            // Compute broadcast output shape
-            var out_shape_buf: [8]i64 = undefined;
-            const max_ndim = @max(lhs.shape.len, rhs.shape.len);
-            for (0..max_ndim) |i| {
-                const l_idx = if (i < lhs.shape.len) lhs.shape.len - 1 - i else null;
-                const r_idx = if (i < rhs.shape.len) rhs.shape.len - 1 - i else null;
-                const l_dim: i64 = if (l_idx) |idx| lhs.shape[idx] else 1;
-                const r_dim: i64 = if (r_idx) |idx| rhs.shape[idx] else 1;
-                out_shape_buf[max_ndim - 1 - i] = @max(l_dim, r_dim);
-            }
-            const output = try RuntimeTensor.alloc(self.allocator, lhs.dtype, out_shape_buf[0..max_ndim]);
+            const output = try RuntimeTensor.alloc(self.allocator, lhs.dtype, out_shape);
             if (self.buffers[output_idx]) |*existing| {
                 existing.deinit();
             }
@@ -968,19 +990,33 @@ pub const Executor = struct {
             return;
         }
 
-        // For now, require same shape (no broadcasting)
-        // TODO: Implement broadcasting
-        if (lhs.numel != rhs.numel) {
-            // Check if one is a scalar
-            if (rhs.numel == 1) {
-                return self.execBinaryOpScalarRhs(node, op, &lhs, &rhs, output_idx);
-            }
-            if (lhs.numel == 1) {
-                return self.execBinaryOpScalarLhs(node, op, &lhs, &rhs, output_idx);
-            }
-            std.debug.print("Shape mismatch: {} vs {}\n", .{ lhs.numel, rhs.numel });
-            return error.ShapeMismatch;
+        // Fast path: same shape, no broadcasting needed
+        if (lhs.numel == rhs.numel and std.mem.eql(i64, lhs.shape, rhs.shape)) {
+            return self.execBinaryOpSameShape(node, op, &lhs, &rhs, output_idx);
         }
+
+        // Scalar optimization
+        if (rhs.numel == 1) {
+            return self.execBinaryOpScalarRhs(node, op, &lhs, &rhs, output_idx);
+        }
+        if (lhs.numel == 1) {
+            return self.execBinaryOpScalarLhs(node, op, &lhs, &rhs, output_idx);
+        }
+
+        // General broadcasting case
+        return self.execBinaryOpBroadcast(op, &lhs, &rhs, out_shape, output_idx);
+    }
+
+    /// Execute binary op with same shapes (fast path)
+    fn execBinaryOpSameShape(
+        self: *Executor,
+        node: Node,
+        comptime op: kernels.elementwise.OpTag,
+        lhs: *const RuntimeTensor,
+        rhs: *const RuntimeTensor,
+        output_idx: u32,
+    ) !void {
+        _ = node;
 
         // Handle mixed dtype cases - promote to f32 if types don't match
         const out_dtype = if (lhs.dtype == rhs.dtype)
@@ -1035,6 +1071,194 @@ pub const Executor = struct {
             existing.deinit();
         }
         self.buffers[output_idx] = output;
+    }
+
+    /// Execute binary op with broadcasting (general case)
+    fn execBinaryOpBroadcast(
+        self: *Executor,
+        comptime op: kernels.elementwise.OpTag,
+        lhs: *const RuntimeTensor,
+        rhs: *const RuntimeTensor,
+        out_shape: []const i64,
+        output_idx: u32,
+    ) !void {
+        // Determine output dtype (promote f16 + f32 to f32)
+        const out_dtype: DType = if (lhs.dtype == rhs.dtype)
+            lhs.dtype
+        else if ((lhs.dtype == .f16 and rhs.dtype == .f32) or (lhs.dtype == .f32 and rhs.dtype == .f16))
+            .f32
+        else
+            lhs.dtype;
+
+        var output = try RuntimeTensor.alloc(self.allocator, out_dtype, out_shape);
+        errdefer output.deinit();
+
+        // Compute strides for input tensors (with broadcasting)
+        // For broadcasting, stride is 0 when dimension is 1
+        var lhs_strides: [8]usize = undefined;
+        var rhs_strides: [8]usize = undefined;
+        var out_strides: [8]usize = undefined;
+        const ndim = out_shape.len;
+
+        // Compute output strides (row-major)
+        var stride: usize = 1;
+        var i: usize = ndim;
+        while (i > 0) {
+            i -= 1;
+            out_strides[i] = stride;
+            stride *= @intCast(out_shape[i]);
+        }
+
+        // Compute lhs strides with broadcasting
+        stride = 1;
+        i = lhs.shape.len;
+        while (i > 0) {
+            i -= 1;
+            const out_idx = ndim - (lhs.shape.len - i);
+            if (lhs.shape[i] == 1) {
+                lhs_strides[out_idx] = 0; // Broadcast: stride 0
+            } else {
+                lhs_strides[out_idx] = stride;
+                stride *= @intCast(lhs.shape[i]);
+            }
+        }
+        // Fill remaining leading dims with 0 (implicit broadcast from shape 1)
+        for (0..ndim - lhs.shape.len) |j| {
+            lhs_strides[j] = 0;
+        }
+
+        // Compute rhs strides with broadcasting
+        stride = 1;
+        i = rhs.shape.len;
+        while (i > 0) {
+            i -= 1;
+            const out_idx = ndim - (rhs.shape.len - i);
+            if (rhs.shape[i] == 1) {
+                rhs_strides[out_idx] = 0; // Broadcast: stride 0
+            } else {
+                rhs_strides[out_idx] = stride;
+                stride *= @intCast(rhs.shape[i]);
+            }
+        }
+        // Fill remaining leading dims with 0
+        for (0..ndim - rhs.shape.len) |j| {
+            rhs_strides[j] = 0;
+        }
+
+        // Execute with type dispatch
+        switch (out_dtype) {
+            inline .f32, .f16, .i32, .i64 => |dtype| {
+                const T = dtype.ZigType();
+                try self.execBroadcastTyped(T, op, lhs, rhs, &output, out_shape, lhs_strides[0..ndim], rhs_strides[0..ndim], out_strides[0..ndim]);
+            },
+            else => return error.UnsupportedDType,
+        }
+
+        if (self.buffers[output_idx]) |*existing| {
+            existing.deinit();
+        }
+        self.buffers[output_idx] = output;
+    }
+
+    /// Type-specific broadcast execution
+    fn execBroadcastTyped(
+        self: *Executor,
+        comptime T: type,
+        comptime op: kernels.elementwise.OpTag,
+        lhs: *const RuntimeTensor,
+        rhs: *const RuntimeTensor,
+        output: *RuntimeTensor,
+        out_shape: []const i64,
+        lhs_strides: []const usize,
+        rhs_strides: []const usize,
+        out_strides: []const usize,
+    ) !void {
+        _ = out_strides;
+
+        // Get data slices, converting dtypes if needed
+        const lhs_data = try self.getDataAsType(T, lhs);
+        defer if (lhs.dtype != comptime DType.fromZigType(T)) self.allocator.free(lhs_data);
+
+        const rhs_data = try self.getDataAsType(T, rhs);
+        defer if (rhs.dtype != comptime DType.fromZigType(T)) self.allocator.free(rhs_data);
+
+        const out_data = output.asSlice(T).?;
+        const ndim = out_shape.len;
+
+        // Iterate over output elements
+        var coords: [8]usize = .{0} ** 8;
+        for (out_data, 0..) |*out, out_idx| {
+            _ = out_idx;
+
+            // Compute input indices using strides
+            var lhs_idx: usize = 0;
+            var rhs_idx: usize = 0;
+            for (0..ndim) |d| {
+                lhs_idx += coords[d] * lhs_strides[d];
+                rhs_idx += coords[d] * rhs_strides[d];
+            }
+
+            // Apply operation
+            const a = lhs_data[lhs_idx];
+            const b = rhs_data[rhs_idx];
+            out.* = applyBinaryOp(T, op, a, b);
+
+            // Increment coordinates (row-major order)
+            var d: usize = ndim;
+            while (d > 0) {
+                d -= 1;
+                coords[d] += 1;
+                if (coords[d] < @as(usize, @intCast(out_shape[d]))) break;
+                coords[d] = 0;
+            }
+        }
+    }
+
+    /// Get tensor data as specific type, converting if needed
+    fn getDataAsType(self: *Executor, comptime T: type, tensor: *const RuntimeTensor) ![]const T {
+        const target_dtype = comptime DType.fromZigType(T);
+        if (tensor.dtype == target_dtype) {
+            return tensor.asConstSlice(T).?;
+        }
+
+        // Need to convert
+        const result = try self.allocator.alloc(T, tensor.numel);
+        errdefer self.allocator.free(result);
+
+        if (@typeInfo(T) == .float) {
+            if (tensor.asConstSlice(f32)) |src| {
+                for (src, result) |v, *o| o.* = @floatCast(v);
+                return result;
+            }
+            if (tensor.asConstSlice(f16)) |src| {
+                for (src, result) |v, *o| o.* = @floatCast(v);
+                return result;
+            }
+            if (tensor.asConstSlice(i32)) |src| {
+                for (src, result) |v, *o| o.* = @floatFromInt(v);
+                return result;
+            }
+            if (tensor.asConstSlice(i64)) |src| {
+                for (src, result) |v, *o| o.* = @floatFromInt(v);
+                return result;
+            }
+        }
+        return error.UnsupportedDType;
+    }
+
+    /// Apply binary operation to two values
+    fn applyBinaryOp(comptime T: type, comptime op: kernels.elementwise.OpTag, a: T, b: T) T {
+        return switch (op) {
+            .add => a + b,
+            .sub => a - b,
+            .mul => a * b,
+            .div => if (@typeInfo(T) == .int) @divTrunc(a, b) else a / b,
+            .max => @max(a, b),
+            .min => @min(a, b),
+            .pow => if (@typeInfo(T) == .float) std.math.pow(T, a, b) else a,
+            // Unary ops - shouldn't be called via binary broadcast path
+            else => unreachable,
+        };
     }
 
     fn execBinaryOpScalarRhs(
@@ -3439,6 +3663,199 @@ pub const Executor = struct {
         }
     }
 
+    /// Execute ReduceL2 - L2 norm reduction
+    fn execReduceL2(self: *Executor, node: Node) !void {
+        if (node.inputs.len < 1 or node.outputs.len < 1) return error.InvalidNode;
+
+        const input = self.buffers[node.inputs[0]] orelse return error.MissingInput;
+        const output_idx = node.outputs[0];
+
+        var axes_buf: [16]i64 = undefined;
+        var num_axes: usize = 0;
+        var keepdims: bool = true;
+
+        switch (node.attributes) {
+            .reduce => |attrs| {
+                if (attrs.axes) |axes| {
+                    num_axes = axes.len;
+                    for (axes, 0..) |a, i| axes_buf[i] = a;
+                }
+                keepdims = attrs.keepdims;
+            },
+            else => {},
+        }
+
+        if (num_axes == 0) {
+            num_axes = input.shape.len;
+            for (0..num_axes) |i| axes_buf[i] = @intCast(i);
+        }
+
+        for (0..num_axes) |i| {
+            if (axes_buf[i] < 0) {
+                axes_buf[i] += @intCast(input.shape.len);
+            }
+        }
+
+        if (input.dtype != .f32) return error.UnsupportedDType;
+
+        var out_shape: [16]i64 = undefined;
+        var out_ndim: usize = 0;
+
+        for (input.shape, 0..) |dim, i| {
+            var is_reduced = false;
+            for (axes_buf[0..num_axes]) |ax| {
+                if (@as(usize, @intCast(ax)) == i) {
+                    is_reduced = true;
+                    break;
+                }
+            }
+            if (is_reduced) {
+                if (keepdims) {
+                    out_shape[out_ndim] = 1;
+                    out_ndim += 1;
+                }
+            } else {
+                out_shape[out_ndim] = dim;
+                out_ndim += 1;
+            }
+        }
+
+        if (out_ndim == 0) {
+            out_shape[0] = 1;
+            out_ndim = 1;
+        }
+
+        var output = try RuntimeTensor.alloc(self.allocator, input.dtype, out_shape[0..out_ndim]);
+        errdefer output.deinit();
+
+        const in_data = input.asConstSlice(f32).?;
+        const out_data = output.asSlice(f32).?;
+
+        @memset(out_data, 0);
+
+        const in_size = input.numel;
+        for (0..in_size) |in_flat| {
+            var remaining = in_flat;
+            var coords: [16]usize = undefined;
+            var d: usize = input.shape.len;
+            while (d > 0) {
+                d -= 1;
+                const dim: usize = @intCast(input.shape[d]);
+                coords[d] = remaining % dim;
+                remaining /= dim;
+            }
+
+            var out_flat: usize = 0;
+            var out_stride: usize = 1;
+            var out_d: usize = out_ndim;
+            d = input.shape.len;
+            while (d > 0) {
+                d -= 1;
+                var is_reduced = false;
+                for (axes_buf[0..num_axes]) |ax| {
+                    if (@as(usize, @intCast(ax)) == d) {
+                        is_reduced = true;
+                        break;
+                    }
+                }
+                if (!is_reduced or keepdims) {
+                    out_d -= 1;
+                    const coord = if (is_reduced) 0 else coords[d];
+                    out_flat += coord * out_stride;
+                    const out_dim: usize = @intCast(out_shape[out_d]);
+                    out_stride *= out_dim;
+                }
+            }
+
+            // Accumulate squared values
+            out_data[out_flat] += in_data[in_flat] * in_data[in_flat];
+        }
+
+        // Take square root
+        for (out_data) |*o| {
+            o.* = @sqrt(o.*);
+        }
+
+        if (self.buffers[output_idx]) |*existing| existing.deinit();
+        self.buffers[output_idx] = output;
+    }
+
+    /// Execute Tile - repeat tensor along axes
+    fn execTile(self: *Executor, node: Node) !void {
+        if (node.inputs.len < 2 or node.outputs.len < 1) return error.InvalidNode;
+
+        const input = self.buffers[node.inputs[0]] orelse return error.MissingInput;
+        const repeats_tensor = self.buffers[node.inputs[1]] orelse return error.MissingInput;
+        const output_idx = node.outputs[0];
+
+        const repeats = repeats_tensor.asConstSlice(i64) orelse return error.UnsupportedDType;
+
+        if (repeats.len != input.shape.len) return error.ShapeMismatch;
+
+        // Calculate output shape
+        var out_shape_buf: [8]i64 = undefined;
+        for (input.shape, 0..) |dim, i| {
+            out_shape_buf[i] = dim * repeats[i];
+        }
+        const out_shape = out_shape_buf[0..input.shape.len];
+
+        var output = try RuntimeTensor.alloc(self.allocator, input.dtype, out_shape);
+        errdefer output.deinit();
+
+        // Calculate input strides
+        var in_strides: [8]usize = undefined;
+        var stride: usize = 1;
+        var d: usize = input.shape.len;
+        while (d > 0) {
+            d -= 1;
+            in_strides[d] = stride;
+            stride *= @intCast(input.shape[d]);
+        }
+
+        // Calculate output strides
+        var out_strides: [8]usize = undefined;
+        stride = 1;
+        d = input.shape.len;
+        while (d > 0) {
+            d -= 1;
+            out_strides[d] = stride;
+            stride *= @intCast(out_shape[d]);
+        }
+
+        const numel = output.numel;
+        const ndim = input.shape.len;
+
+        switch (input.dtype) {
+            inline .f32, .f16, .i32, .i64 => |dt| {
+                const T = dt.ZigType();
+                const in_data = input.asConstSlice(T).?;
+                const out_data = output.asSlice(T).?;
+
+                for (0..numel) |out_flat| {
+                    // Convert output flat index to coordinates
+                    var remaining = out_flat;
+                    var in_flat: usize = 0;
+
+                    for (0..ndim) |di| {
+                        const out_coord = remaining / out_strides[di];
+                        remaining %= out_strides[di];
+
+                        // Map to input coordinate (wrap around)
+                        const in_dim: usize = @intCast(input.shape[di]);
+                        const in_coord = out_coord % in_dim;
+                        in_flat += in_coord * in_strides[di];
+                    }
+
+                    out_data[out_flat] = in_data[in_flat];
+                }
+            },
+            else => return error.UnsupportedDType,
+        }
+
+        if (self.buffers[output_idx]) |*existing| existing.deinit();
+        self.buffers[output_idx] = output;
+    }
+
     /// Execute Gemm: Y = alpha * A @ B + beta * C
     fn execGemm(self: *Executor, node: Node) !void {
         if (node.inputs.len < 2 or node.outputs.len < 1) return error.InvalidNode;
@@ -3884,8 +4301,109 @@ pub const Executor = struct {
             if (self.buffers[output_idx]) |*existing| existing.deinit();
             self.buffers[output_idx] = output;
         } else {
-            // 2D Convolution - not implemented yet
-            return error.UnsupportedOp;
+            // 2D Convolution
+            const in_height: usize = @intCast(x.shape[2]);
+            const in_width: usize = @intCast(x.shape[3]);
+            const kernel_h: usize = @intCast(w.shape[2]);
+            const kernel_w: usize = @intCast(w.shape[3]);
+
+            // Validate and extract strides
+            const raw_stride_h: i64 = if (strides.len > 0) strides[0] else 1;
+            const raw_stride_w: i64 = if (strides.len > 1) strides[1] else raw_stride_h;
+            const stride_h: usize = if (raw_stride_h > 0 and raw_stride_h < 1000) @intCast(raw_stride_h) else 1;
+            const stride_w: usize = if (raw_stride_w > 0 and raw_stride_w < 1000) @intCast(raw_stride_w) else 1;
+
+            // Validate and extract pads [top, left, bottom, right] or [top, left] repeated
+            const raw_pad_top: i64 = if (pads.len > 0) pads[0] else 0;
+            const raw_pad_left: i64 = if (pads.len > 1) pads[1] else raw_pad_top;
+            const raw_pad_bottom: i64 = if (pads.len > 2) pads[2] else raw_pad_top;
+            const raw_pad_right: i64 = if (pads.len > 3) pads[3] else raw_pad_left;
+            const pad_top: usize = if (raw_pad_top >= 0 and raw_pad_top < 10000) @intCast(raw_pad_top) else 0;
+            const pad_left: usize = if (raw_pad_left >= 0 and raw_pad_left < 10000) @intCast(raw_pad_left) else 0;
+            const pad_bottom: usize = if (raw_pad_bottom >= 0 and raw_pad_bottom < 10000) @intCast(raw_pad_bottom) else 0;
+            const pad_right: usize = if (raw_pad_right >= 0 and raw_pad_right < 10000) @intCast(raw_pad_right) else 0;
+
+            // Validate and extract dilations
+            const raw_dilation_h: i64 = if (dilations.len > 0) dilations[0] else 1;
+            const raw_dilation_w: i64 = if (dilations.len > 1) dilations[1] else raw_dilation_h;
+            const dilation_h: usize = if (raw_dilation_h > 0 and raw_dilation_h < 1000) @intCast(raw_dilation_h) else 1;
+            const dilation_w: usize = if (raw_dilation_w > 0 and raw_dilation_w < 1000) @intCast(raw_dilation_w) else 1;
+
+            if (kernel_h == 0 or kernel_w == 0) return error.InvalidNode;
+
+            // Calculate output dimensions
+            const dilated_kernel_h = (kernel_h - 1) * dilation_h + 1;
+            const dilated_kernel_w = (kernel_w - 1) * dilation_w + 1;
+            const padded_height = in_height + pad_top + pad_bottom;
+            const padded_width = in_width + pad_left + pad_right;
+            const out_height = if (padded_height >= dilated_kernel_h)
+                (padded_height - dilated_kernel_h) / stride_h + 1
+            else
+                0;
+            const out_width = if (padded_width >= dilated_kernel_w)
+                (padded_width - dilated_kernel_w) / stride_w + 1
+            else
+                0;
+
+            const out_shape = [_]i64{
+                @intCast(batch),
+                @intCast(out_channels),
+                @intCast(out_height),
+                @intCast(out_width),
+            };
+
+            var output = try RuntimeTensor.alloc(self.allocator, .f32, &out_shape);
+            errdefer output.deinit();
+            const out_data = output.asSlice(f32).?;
+
+            const in_c_per_group = in_channels / group;
+            const out_c_per_group = out_channels / group;
+
+            // Perform 2D convolution
+            for (0..batch) |b| {
+                for (0..out_channels) |oc| {
+                    const g = oc / out_c_per_group;
+
+                    for (0..out_height) |oh| {
+                        for (0..out_width) |ow| {
+                            var sum: f32 = 0;
+                            const in_start_h = oh * stride_h;
+                            const in_start_w = ow * stride_w;
+
+                            for (0..in_c_per_group) |ic_g| {
+                                const ic = g * in_c_per_group + ic_g;
+
+                                for (0..kernel_h) |kh| {
+                                    for (0..kernel_w) |kw| {
+                                        const in_h_signed: i64 = @as(i64, @intCast(in_start_h + kh * dilation_h)) - @as(i64, @intCast(pad_top));
+                                        const in_w_signed: i64 = @as(i64, @intCast(in_start_w + kw * dilation_w)) - @as(i64, @intCast(pad_left));
+
+                                        if (in_h_signed >= 0 and in_h_signed < @as(i64, @intCast(in_height)) and
+                                            in_w_signed >= 0 and in_w_signed < @as(i64, @intCast(in_width)))
+                                        {
+                                            const in_h: usize = @intCast(in_h_signed);
+                                            const in_w: usize = @intCast(in_w_signed);
+                                            const x_idx = ((b * in_channels + ic) * in_height + in_h) * in_width + in_w;
+                                            const w_idx = ((oc * in_c_per_group + ic_g) * kernel_h + kh) * kernel_w + kw;
+                                            sum += x_f32[x_idx] * w_f32[w_idx];
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (bias_f32) |bf| {
+                                sum += bf[oc];
+                            }
+
+                            const out_idx = ((b * out_channels + oc) * out_height + oh) * out_width + ow;
+                            out_data[out_idx] = sum;
+                        }
+                    }
+                }
+            }
+
+            if (self.buffers[output_idx]) |*existing| existing.deinit();
+            self.buffers[output_idx] = output;
         }
     }
 
@@ -3995,6 +4513,465 @@ pub const Executor = struct {
 
         if (self.buffers[output_idx]) |*existing| existing.deinit();
         self.buffers[output_idx] = output;
+    }
+
+    /// Execute MaxPool (2D max pooling)
+    fn execMaxPool(self: *Executor, node: Node) !void {
+        // MaxPool inputs: X [batch, channels, height, width]
+        // MaxPool outputs: Y, optional Indices
+        if (node.inputs.len < 1 or node.outputs.len < 1) return error.InvalidNode;
+
+        const input = self.buffers[node.inputs[0]] orelse return error.MissingInput;
+        const output_idx = node.outputs[0];
+
+        if (input.shape.len != 4) return error.InvalidShape;
+
+        const batch: usize = @intCast(input.shape[0]);
+        const channels: usize = @intCast(input.shape[1]);
+        const in_height: usize = @intCast(input.shape[2]);
+        const in_width: usize = @intCast(input.shape[3]);
+
+        // Get attributes
+        const attrs = node.attributes.pool;
+        const default_kernel = [_]i64{ 2, 2 };
+        const default_stride = [_]i64{ 1, 1 };
+        const default_pads = [_]i64{ 0, 0, 0, 0 };
+
+        const kernel_shape = attrs.kernel_shape orelse &default_kernel;
+        const strides_attr = attrs.strides orelse &default_stride;
+        const pads = attrs.pads orelse &default_pads;
+
+        const kernel_h: usize = @intCast(kernel_shape[0]);
+        const kernel_w: usize = if (kernel_shape.len > 1) @intCast(kernel_shape[1]) else kernel_h;
+        const stride_h: usize = @intCast(strides_attr[0]);
+        const stride_w: usize = if (strides_attr.len > 1) @intCast(strides_attr[1]) else stride_h;
+        const pad_top: usize = @intCast(pads[0]);
+        const pad_left: usize = if (pads.len > 1) @intCast(pads[1]) else pad_top;
+        const pad_bottom: usize = if (pads.len > 2) @intCast(pads[2]) else pad_top;
+        const pad_right: usize = if (pads.len > 3) @intCast(pads[3]) else pad_left;
+
+        const padded_height = in_height + pad_top + pad_bottom;
+        const padded_width = in_width + pad_left + pad_right;
+        const out_height = if (padded_height >= kernel_h) (padded_height - kernel_h) / stride_h + 1 else 0;
+        const out_width = if (padded_width >= kernel_w) (padded_width - kernel_w) / stride_w + 1 else 0;
+
+        const out_shape = [_]i64{
+            @intCast(batch),
+            @intCast(channels),
+            @intCast(out_height),
+            @intCast(out_width),
+        };
+
+        var output = try RuntimeTensor.alloc(self.allocator, input.dtype, &out_shape);
+        errdefer output.deinit();
+
+        if (input.asConstSlice(f32)) |in_data| {
+            const out_data = output.asSlice(f32).?;
+
+            for (0..batch) |b| {
+                for (0..channels) |c| {
+                    for (0..out_height) |oh| {
+                        for (0..out_width) |ow| {
+                            var max_val: f32 = -std.math.inf(f32);
+                            const in_start_h = oh * stride_h;
+                            const in_start_w = ow * stride_w;
+
+                            for (0..kernel_h) |kh| {
+                                for (0..kernel_w) |kw| {
+                                    const h_signed: i64 = @as(i64, @intCast(in_start_h + kh)) - @as(i64, @intCast(pad_top));
+                                    const w_signed: i64 = @as(i64, @intCast(in_start_w + kw)) - @as(i64, @intCast(pad_left));
+
+                                    if (h_signed >= 0 and h_signed < @as(i64, @intCast(in_height)) and
+                                        w_signed >= 0 and w_signed < @as(i64, @intCast(in_width)))
+                                    {
+                                        const h: usize = @intCast(h_signed);
+                                        const w: usize = @intCast(w_signed);
+                                        const idx = ((b * channels + c) * in_height + h) * in_width + w;
+                                        max_val = @max(max_val, in_data[idx]);
+                                    }
+                                }
+                            }
+
+                            const out_idx = ((b * channels + c) * out_height + oh) * out_width + ow;
+                            out_data[out_idx] = max_val;
+                        }
+                    }
+                }
+            }
+        } else {
+            return error.UnsupportedDType;
+        }
+
+        if (self.buffers[output_idx]) |*existing| existing.deinit();
+        self.buffers[output_idx] = output;
+    }
+
+    /// Execute AveragePool (2D average pooling)
+    fn execAveragePool(self: *Executor, node: Node) !void {
+        if (node.inputs.len < 1 or node.outputs.len < 1) return error.InvalidNode;
+
+        const input = self.buffers[node.inputs[0]] orelse return error.MissingInput;
+        const output_idx = node.outputs[0];
+
+        if (input.shape.len != 4) return error.InvalidShape;
+
+        const batch: usize = @intCast(input.shape[0]);
+        const channels: usize = @intCast(input.shape[1]);
+        const in_height: usize = @intCast(input.shape[2]);
+        const in_width: usize = @intCast(input.shape[3]);
+
+        const attrs = node.attributes.pool;
+        const default_kernel = [_]i64{ 2, 2 };
+        const default_stride = [_]i64{ 1, 1 };
+        const default_pads = [_]i64{ 0, 0, 0, 0 };
+
+        const kernel_shape = attrs.kernel_shape orelse &default_kernel;
+        const strides_attr = attrs.strides orelse &default_stride;
+        const pads = attrs.pads orelse &default_pads;
+
+        const kernel_h: usize = @intCast(kernel_shape[0]);
+        const kernel_w: usize = if (kernel_shape.len > 1) @intCast(kernel_shape[1]) else kernel_h;
+        const stride_h: usize = @intCast(strides_attr[0]);
+        const stride_w: usize = if (strides_attr.len > 1) @intCast(strides_attr[1]) else stride_h;
+        const pad_top: usize = @intCast(pads[0]);
+        const pad_left: usize = if (pads.len > 1) @intCast(pads[1]) else pad_top;
+        const pad_bottom: usize = if (pads.len > 2) @intCast(pads[2]) else pad_top;
+        const pad_right: usize = if (pads.len > 3) @intCast(pads[3]) else pad_left;
+        const count_include_pad = attrs.count_include_pad;
+
+        const padded_height = in_height + pad_top + pad_bottom;
+        const padded_width = in_width + pad_left + pad_right;
+        const out_height = if (padded_height >= kernel_h) (padded_height - kernel_h) / stride_h + 1 else 0;
+        const out_width = if (padded_width >= kernel_w) (padded_width - kernel_w) / stride_w + 1 else 0;
+
+        const out_shape = [_]i64{
+            @intCast(batch),
+            @intCast(channels),
+            @intCast(out_height),
+            @intCast(out_width),
+        };
+
+        var output = try RuntimeTensor.alloc(self.allocator, input.dtype, &out_shape);
+        errdefer output.deinit();
+
+        if (input.asConstSlice(f32)) |in_data| {
+            const out_data = output.asSlice(f32).?;
+
+            for (0..batch) |b| {
+                for (0..channels) |c| {
+                    for (0..out_height) |oh| {
+                        for (0..out_width) |ow| {
+                            var sum: f32 = 0;
+                            var count: usize = 0;
+                            const in_start_h = oh * stride_h;
+                            const in_start_w = ow * stride_w;
+
+                            for (0..kernel_h) |kh| {
+                                for (0..kernel_w) |kw| {
+                                    const h_signed: i64 = @as(i64, @intCast(in_start_h + kh)) - @as(i64, @intCast(pad_top));
+                                    const w_signed: i64 = @as(i64, @intCast(in_start_w + kw)) - @as(i64, @intCast(pad_left));
+
+                                    if (h_signed >= 0 and h_signed < @as(i64, @intCast(in_height)) and
+                                        w_signed >= 0 and w_signed < @as(i64, @intCast(in_width)))
+                                    {
+                                        const h: usize = @intCast(h_signed);
+                                        const w: usize = @intCast(w_signed);
+                                        const idx = ((b * channels + c) * in_height + h) * in_width + w;
+                                        sum += in_data[idx];
+                                        count += 1;
+                                    } else if (count_include_pad) {
+                                        count += 1;
+                                    }
+                                }
+                            }
+
+                            const out_idx = ((b * channels + c) * out_height + oh) * out_width + ow;
+                            out_data[out_idx] = if (count > 0) sum / @as(f32, @floatFromInt(count)) else 0;
+                        }
+                    }
+                }
+            }
+        } else {
+            return error.UnsupportedDType;
+        }
+
+        if (self.buffers[output_idx]) |*existing| existing.deinit();
+        self.buffers[output_idx] = output;
+    }
+
+    /// Execute GlobalAveragePool
+    fn execGlobalAveragePool(self: *Executor, node: Node) !void {
+        if (node.inputs.len < 1 or node.outputs.len < 1) return error.InvalidNode;
+
+        const input = self.buffers[node.inputs[0]] orelse return error.MissingInput;
+        const output_idx = node.outputs[0];
+
+        if (input.shape.len < 3) return error.InvalidShape;
+
+        // Output shape: same as input but spatial dims become 1
+        var out_shape_buf: [8]i64 = undefined;
+        for (input.shape, 0..) |dim, i| {
+            out_shape_buf[i] = if (i >= 2) 1 else dim;
+        }
+        const out_shape = out_shape_buf[0..input.shape.len];
+
+        var output = try RuntimeTensor.alloc(self.allocator, input.dtype, out_shape);
+        errdefer output.deinit();
+
+        if (input.asConstSlice(f32)) |in_data| {
+            const out_data = output.asSlice(f32).?;
+
+            // Calculate spatial size
+            var spatial_size: usize = 1;
+            for (input.shape[2..]) |dim| {
+                spatial_size *= @intCast(dim);
+            }
+
+            const batch: usize = @intCast(input.shape[0]);
+            const channels: usize = @intCast(input.shape[1]);
+
+            for (0..batch) |b| {
+                for (0..channels) |c| {
+                    var sum: f32 = 0;
+                    const base_idx = (b * channels + c) * spatial_size;
+                    for (0..spatial_size) |s| {
+                        sum += in_data[base_idx + s];
+                    }
+                    out_data[b * channels + c] = sum / @as(f32, @floatFromInt(spatial_size));
+                }
+            }
+        } else {
+            return error.UnsupportedDType;
+        }
+
+        if (self.buffers[output_idx]) |*existing| existing.deinit();
+        self.buffers[output_idx] = output;
+    }
+
+    /// Execute BatchNormalization
+    fn execBatchNorm(self: *Executor, node: Node) !void {
+        // BatchNormalization inputs:
+        // 0: X [batch, channels, ...]
+        // 1: scale [channels]
+        // 2: B (bias) [channels]
+        // 3: input_mean [channels]
+        // 4: input_var [channels]
+        if (node.inputs.len < 5 or node.outputs.len < 1) return error.InvalidNode;
+
+        const input = self.buffers[node.inputs[0]] orelse return error.MissingInput;
+        const scale = self.buffers[node.inputs[1]] orelse return error.MissingInput;
+        const bias = self.buffers[node.inputs[2]] orelse return error.MissingInput;
+        const mean = self.buffers[node.inputs[3]] orelse return error.MissingInput;
+        const variance = self.buffers[node.inputs[4]] orelse return error.MissingInput;
+        const output_idx = node.outputs[0];
+
+        if (input.shape.len < 2) return error.InvalidShape;
+
+        const attrs = node.attributes.batch_norm;
+        const epsilon: f32 = attrs.epsilon;
+
+        var output = try RuntimeTensor.alloc(self.allocator, input.dtype, input.shape);
+        errdefer output.deinit();
+
+        if (input.asConstSlice(f32)) |in_data| {
+            const out_data = output.asSlice(f32).?;
+            const scale_data = scale.asConstSlice(f32) orelse return error.UnsupportedDType;
+            const bias_data = bias.asConstSlice(f32) orelse return error.UnsupportedDType;
+            const mean_data = mean.asConstSlice(f32) orelse return error.UnsupportedDType;
+            const var_data = variance.asConstSlice(f32) orelse return error.UnsupportedDType;
+
+            const batch: usize = @intCast(input.shape[0]);
+            const channels: usize = @intCast(input.shape[1]);
+
+            // Calculate spatial size (all dimensions after channels)
+            var spatial_size: usize = 1;
+            for (input.shape[2..]) |dim| {
+                spatial_size *= @intCast(dim);
+            }
+
+            for (0..batch) |b| {
+                for (0..channels) |c| {
+                    const gamma = scale_data[c];
+                    const beta = bias_data[c];
+                    const mu = mean_data[c];
+                    const sigma = @sqrt(var_data[c] + epsilon);
+
+                    const base_idx = (b * channels + c) * spatial_size;
+                    for (0..spatial_size) |s| {
+                        const idx = base_idx + s;
+                        out_data[idx] = gamma * (in_data[idx] - mu) / sigma + beta;
+                    }
+                }
+            }
+        } else {
+            return error.UnsupportedDType;
+        }
+
+        if (self.buffers[output_idx]) |*existing| existing.deinit();
+        self.buffers[output_idx] = output;
+    }
+
+    /// Execute Flatten
+    fn execFlatten(self: *Executor, node: Node) !void {
+        if (node.inputs.len < 1 or node.outputs.len < 1) return error.InvalidNode;
+
+        const input = self.buffers[node.inputs[0]] orelse return error.MissingInput;
+        const output_idx = node.outputs[0];
+
+        const attrs = node.attributes.flatten;
+        var axis: i64 = attrs.axis;
+
+        // Handle negative axis
+        const ndim = @as(i64, @intCast(input.shape.len));
+        if (axis < 0) axis += ndim;
+        if (axis < 0 or axis > ndim) return error.InvalidAxis;
+
+        const axis_usize: usize = @intCast(axis);
+
+        // Calculate output shape [dim0 * ... * dim(axis-1), dim(axis) * ... * dim(n-1)]
+        var dim0: i64 = 1;
+        var dim1: i64 = 1;
+
+        for (input.shape[0..axis_usize]) |d| {
+            dim0 *= d;
+        }
+        for (input.shape[axis_usize..]) |d| {
+            dim1 *= d;
+        }
+
+        const out_shape = [_]i64{ dim0, dim1 };
+
+        // Allocate output and copy data (reshape is just a view change)
+        var output = try RuntimeTensor.alloc(self.allocator, input.dtype, &out_shape);
+        errdefer output.deinit();
+
+        @memcpy(output.data, input.data[0..@min(output.data.len, input.data.len)]);
+
+        if (self.buffers[output_idx]) |*existing| existing.deinit();
+        self.buffers[output_idx] = output;
+    }
+
+    /// Execute Split
+    fn execSplit(self: *Executor, node: Node) !void {
+        if (node.inputs.len < 1 or node.outputs.len < 1) return error.InvalidNode;
+
+        const input = self.buffers[node.inputs[0]] orelse return error.MissingInput;
+
+        const attrs = node.attributes.split;
+        var axis: i64 = attrs.axis;
+
+        // Handle negative axis
+        const ndim = @as(i64, @intCast(input.shape.len));
+        if (axis < 0) axis += ndim;
+        if (axis < 0 or axis >= ndim) return error.InvalidAxis;
+
+        const axis_usize: usize = @intCast(axis);
+        const axis_dim: usize = @intCast(input.shape[axis_usize]);
+        const num_outputs = node.outputs.len;
+
+        // Get split sizes from attribute or input
+        var split_sizes_buf: [16]usize = undefined;
+        var split_sizes: []usize = undefined;
+
+        if (attrs.split) |split_attr| {
+            // Split sizes from attribute
+            if (split_attr.len > 16) return error.TooManySplits;
+            for (split_attr, 0..) |s, i| {
+                split_sizes_buf[i] = @intCast(s);
+            }
+            split_sizes = split_sizes_buf[0..split_attr.len];
+        } else if (node.inputs.len > 1) {
+            // Split sizes from input tensor
+            if (self.buffers[node.inputs[1]]) |split_tensor| {
+                if (split_tensor.asConstSlice(i64)) |split_data| {
+                    if (split_data.len > 16) return error.TooManySplits;
+                    for (split_data, 0..) |s, i| {
+                        split_sizes_buf[i] = @intCast(s);
+                    }
+                    split_sizes = split_sizes_buf[0..split_data.len];
+                } else {
+                    return error.UnsupportedDType;
+                }
+            } else {
+                // Equal split
+                const chunk_size = axis_dim / num_outputs;
+                for (0..num_outputs) |i| {
+                    split_sizes_buf[i] = chunk_size;
+                }
+                split_sizes = split_sizes_buf[0..num_outputs];
+            }
+        } else {
+            // Equal split
+            const chunk_size = axis_dim / num_outputs;
+            for (0..num_outputs) |i| {
+                split_sizes_buf[i] = chunk_size;
+            }
+            split_sizes = split_sizes_buf[0..num_outputs];
+        }
+
+        // Calculate strides
+        var in_strides: [8]usize = undefined;
+        var stride: usize = 1;
+        var d: usize = input.shape.len;
+        while (d > 0) {
+            d -= 1;
+            in_strides[d] = stride;
+            stride *= @intCast(input.shape[d]);
+        }
+
+        var offset: usize = 0;
+        for (node.outputs, 0..) |output_idx, out_i| {
+            if (out_i >= split_sizes.len) break;
+
+            const split_size = split_sizes[out_i];
+
+            // Create output shape
+            var out_shape_buf: [8]i64 = undefined;
+            for (input.shape, 0..) |dim, i| {
+                out_shape_buf[i] = if (i == axis_usize) @intCast(split_size) else dim;
+            }
+            const out_shape = out_shape_buf[0..input.shape.len];
+
+            var output = try RuntimeTensor.alloc(self.allocator, input.dtype, out_shape);
+            errdefer output.deinit();
+
+            // Copy data for this split
+            const in_data = input.data;
+            const out_data = output.data;
+
+            // Elements before axis, at axis, after axis
+            var outer_size: usize = 1;
+            for (input.shape[0..axis_usize]) |dim| {
+                outer_size *= @intCast(dim);
+            }
+            var inner_size: usize = 1;
+            for (input.shape[axis_usize + 1 ..]) |dim| {
+                inner_size *= @intCast(dim);
+            }
+
+            const elem_size: usize = switch (input.dtype) {
+                .f32, .i32 => 4,
+                .f64, .i64 => 8,
+                .f16, .bf16 => 2,
+                .u8, .i8 => 1,
+                else => 4,
+            };
+
+            for (0..outer_size) |o| {
+                const in_base = (o * axis_dim + offset) * inner_size * elem_size;
+                const out_base = o * split_size * inner_size * elem_size;
+                const copy_size = split_size * inner_size * elem_size;
+
+                if (in_base + copy_size <= in_data.len and out_base + copy_size <= out_data.len) {
+                    @memcpy(out_data[out_base..][0..copy_size], in_data[in_base..][0..copy_size]);
+                }
+            }
+
+            if (self.buffers[output_idx]) |*existing| existing.deinit();
+            self.buffers[output_idx] = output;
+
+            offset += split_size;
+        }
     }
 
     /// Execute MultiHeadAttention (Microsoft ONNX extension)
