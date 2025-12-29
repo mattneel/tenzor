@@ -224,7 +224,7 @@ fn parseAttributes(allocator: Allocator, op_type: OpType, attrs: []const types.A
         .Squeeze => .{ .squeeze = parseAxesAttr(attrs) },
         .Unsqueeze => .{ .unsqueeze = parseAxesAttr(attrs) },
         .ReduceSum, .ReduceMean, .ReduceMax, .ReduceMin, .ReduceL2 => .{ .reduce = parseReduceAttrs(attrs) },
-        .Conv, .ConvTranspose => .{ .conv = parseConvAttrs(attrs) },
+        .Conv, .ConvTranspose => .{ .conv = try parseConvAttrs(allocator, attrs) },
         .Cast => .{ .cast = parseCastAttrs(attrs) orelse return BuildError.MissingAttribute },
         .Constant => .{ .constant = try parseConstantAttrs(allocator, attrs) },
         .MatMulNBits => .{ .matmul_nbits = parseMatMulNBitsAttrs(attrs) },
@@ -346,22 +346,30 @@ fn parseReduceAttrs(attrs: []const types.AttributeProto) Node.Attributes.ReduceA
     return result;
 }
 
-fn parseConvAttrs(attrs: []const types.AttributeProto) Node.Attributes.ConvAttrs {
+fn parseConvAttrs(allocator: Allocator, attrs: []const types.AttributeProto) BuildError!Node.Attributes.ConvAttrs {
     var result: Node.Attributes.ConvAttrs = .{};
     for (attrs) |attr| {
         const name = attr.name orelse "";
         if (std.mem.eql(u8, name, "kernel_shape")) {
-            if (attr.attr_type == .ints and attr.ints.len > 0) result.kernel_shape = attr.ints;
+            if (attr.attr_type == .ints and attr.ints.len > 0) {
+                result.kernel_shape = allocator.dupe(i64, attr.ints) catch return error.OutOfMemory;
+            }
         } else if (std.mem.eql(u8, name, "strides")) {
-            if (attr.attr_type == .ints and attr.ints.len > 0) result.strides = attr.ints;
+            if (attr.attr_type == .ints and attr.ints.len > 0) {
+                result.strides = allocator.dupe(i64, attr.ints) catch return error.OutOfMemory;
+            }
         } else if (std.mem.eql(u8, name, "pads")) {
-            if (attr.attr_type == .ints and attr.ints.len > 0) result.pads = attr.ints;
+            if (attr.attr_type == .ints and attr.ints.len > 0) {
+                result.pads = allocator.dupe(i64, attr.ints) catch return error.OutOfMemory;
+            }
         } else if (std.mem.eql(u8, name, "dilations")) {
-            if (attr.attr_type == .ints and attr.ints.len > 0) result.dilations = attr.ints;
+            if (attr.attr_type == .ints and attr.ints.len > 0) {
+                result.dilations = allocator.dupe(i64, attr.ints) catch return error.OutOfMemory;
+            }
         } else if (std.mem.eql(u8, name, "group")) {
             result.group = attr.i orelse 1;
         } else if (std.mem.eql(u8, name, "auto_pad")) {
-            result.auto_pad = attr.s orelse "NOTSET";
+            result.auto_pad = allocator.dupe(u8, attr.s orelse "NOTSET") catch return error.OutOfMemory;
         }
     }
     return result;

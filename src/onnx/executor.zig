@@ -775,48 +775,118 @@ pub const Executor = struct {
 
     /// Execute all nodes with debug output
     pub fn runDebug(self: *Executor) !void {
-        for (self.graph.nodes.items, 0..) |node, i| {
-            std.debug.print("[{d}] {s}", .{ i, @tagName(node.op_type) });
+        // Same dependency logic as run(), but with debug output
+        const nodes = self.graph.nodes.items;
+        const n = nodes.len;
 
-            // Print input shapes
-            std.debug.print(" inputs: ", .{});
-            for (node.inputs, 0..) |inp_idx, j| {
-                if (j > 0) std.debug.print(", ", .{});
-                if (self.buffers[inp_idx]) |buf| {
-                    std.debug.print("[", .{});
-                    for (buf.shape, 0..) |dim, k| {
-                        if (k > 0) std.debug.print(",", .{});
-                        std.debug.print("{}", .{dim});
+        var tensor_producer = try self.allocator.alloc(?usize, self.buffers.len);
+        defer self.allocator.free(tensor_producer);
+        @memset(tensor_producer, null);
+
+        for (self.buffers, 0..) |buf, i| {
+            if (buf != null) {
+                tensor_producer[i] = n;
+            }
+        }
+
+        for (nodes, 0..) |node, i| {
+            for (node.outputs) |out_idx| {
+                tensor_producer[out_idx] = i;
+            }
+        }
+
+        var executed = try self.allocator.alloc(bool, n);
+        defer self.allocator.free(executed);
+        @memset(executed, false);
+
+        var exec_order: usize = 0;
+        var remaining = n;
+        while (remaining > 0) {
+            var progress = false;
+
+            for (nodes, 0..) |node, i| {
+                if (executed[i]) continue;
+
+                var ready = true;
+                for (node.inputs) |inp_idx| {
+                    const producer = tensor_producer[inp_idx];
+                    if (producer) |prod_idx| {
+                        if (prod_idx != n and !executed[prod_idx]) {
+                            ready = false;
+                            break;
+                        }
+                    } else {
+                        ready = false;
+                        break;
                     }
-                    std.debug.print("]", .{});
-                } else {
-                    // Print tensor name for debugging
-                    const name = if (inp_idx < self.graph.tensors.items.len)
-                        self.graph.tensors.items[inp_idx].name
-                    else
-                        "?";
-                    std.debug.print("null({s})", .{name});
+                }
+
+                if (ready) {
+                    // Print debug info before execution
+                    std.debug.print("[{d}] {s}", .{ exec_order, @tagName(node.op_type) });
+                    std.debug.print(" inputs: ", .{});
+                    for (node.inputs, 0..) |inp_idx, j| {
+                        if (j > 0) std.debug.print(", ", .{});
+                        if (self.buffers[inp_idx]) |buf| {
+                            std.debug.print("[", .{});
+                            for (buf.shape, 0..) |dim, k| {
+                                if (k > 0) std.debug.print(",", .{});
+                                std.debug.print("{}", .{dim});
+                            }
+                            std.debug.print("]", .{});
+                        } else {
+                            const name = if (inp_idx < self.graph.tensors.items.len)
+                                self.graph.tensors.items[inp_idx].name
+                            else
+                                "?";
+                            std.debug.print("null({s})", .{name});
+                        }
+                    }
+
+                    try self.executeNode(node);
+
+                    // Print output shapes
+                    std.debug.print(" -> ", .{});
+                    for (node.outputs, 0..) |out_idx, j| {
+                        if (j > 0) std.debug.print(", ", .{});
+                        if (self.buffers[out_idx]) |buf| {
+                            std.debug.print("[", .{});
+                            for (buf.shape, 0..) |dim, k| {
+                                if (k > 0) std.debug.print(",", .{});
+                                std.debug.print("{}", .{dim});
+                            }
+                            std.debug.print("]", .{});
+                        } else {
+                            std.debug.print("null", .{});
+                        }
+                    }
+                    std.debug.print("\n", .{});
+
+                    executed[i] = true;
+                    remaining -= 1;
+                    progress = true;
+                    exec_order += 1;
                 }
             }
 
-            try self.executeNode(node);
-
-            // Print output shapes
-            std.debug.print(" -> ", .{});
-            for (node.outputs, 0..) |out_idx, j| {
-                if (j > 0) std.debug.print(", ", .{});
-                if (self.buffers[out_idx]) |buf| {
-                    std.debug.print("[", .{});
-                    for (buf.shape, 0..) |dim, k| {
-                        if (k > 0) std.debug.print(",", .{});
-                        std.debug.print("{}", .{dim});
+            if (!progress and remaining > 0) {
+                for (nodes, 0..) |node, i| {
+                    if (!executed[i]) {
+                        std.debug.print("Cannot execute node {d} ({s}): missing inputs\n", .{ i, @tagName(node.op_type) });
+                        for (node.inputs) |inp_idx| {
+                            if (self.buffers[inp_idx] == null) {
+                                const name = if (inp_idx < self.graph.tensors.items.len)
+                                    self.graph.tensors.items[inp_idx].name
+                                else
+                                    "?";
+                                std.debug.print("  Missing: {s}\n", .{name});
+                            }
+                        }
+                        break;
                     }
-                    std.debug.print("]", .{});
-                } else {
-                    std.debug.print("null", .{});
                 }
+                return error.MissingInput;
             }
-            std.debug.print("\n", .{});
         }
     }
 
@@ -2240,7 +2310,7 @@ pub const Executor = struct {
 
         // Use tenzor's transpose kernel
         switch (input.dtype) {
-            inline .f32, .f16, .i64, .i32 => |dtype| {
+            inline .f32, .f16, .f64, .i64, .i32, .i16, .i8, .u8, .u16, .u32, .u64, .bool_ => |dtype| {
                 const T = dtype.ZigType();
                 const in_data = input.asConstSlice(T).?;
                 const out_data = output.asSlice(T).?;
@@ -2806,6 +2876,32 @@ pub const Executor = struct {
                     else => return error.UnsupportedDType,
                 }
             },
+            .bool_ => {
+                // Bool stored as u8: 0 = false, non-zero = true
+                const in_data = input.asConstSlice(u8).?;
+                switch (target_dtype) {
+                    .f16 => for (in_data, output.asSlice(f16).?) |v, *o| { o.* = if (v != 0) @as(f16, 1.0) else @as(f16, 0.0); },
+                    .f32 => for (in_data, output.asSlice(f32).?) |v, *o| { o.* = if (v != 0) @as(f32, 1.0) else @as(f32, 0.0); },
+                    .f64 => for (in_data, output.asSlice(f64).?) |v, *o| { o.* = if (v != 0) @as(f64, 1.0) else @as(f64, 0.0); },
+                    .i32 => for (in_data, output.asSlice(i32).?) |v, *o| { o.* = if (v != 0) @as(i32, 1) else @as(i32, 0); },
+                    .i64 => for (in_data, output.asSlice(i64).?) |v, *o| { o.* = if (v != 0) @as(i64, 1) else @as(i64, 0); },
+                    .bool_ => @memcpy(output.asSlice(u8).?, in_data),
+                    else => return error.UnsupportedDType,
+                }
+            },
+            .u8 => {
+                const in_data = input.asConstSlice(u8).?;
+                switch (target_dtype) {
+                    .f16 => for (in_data, output.asSlice(f16).?) |v, *o| { o.* = @floatFromInt(v); },
+                    .f32 => for (in_data, output.asSlice(f32).?) |v, *o| { o.* = @floatFromInt(v); },
+                    .f64 => for (in_data, output.asSlice(f64).?) |v, *o| { o.* = @floatFromInt(v); },
+                    .i32 => for (in_data, output.asSlice(i32).?) |v, *o| { o.* = @intCast(v); },
+                    .i64 => for (in_data, output.asSlice(i64).?) |v, *o| { o.* = @intCast(v); },
+                    .u8 => @memcpy(output.asSlice(u8).?, in_data),
+                    .bool_ => @memcpy(output.asSlice(u8).?, in_data),
+                    else => return error.UnsupportedDType,
+                }
+            },
             else => return error.UnsupportedDType,
         }
 
@@ -3303,11 +3399,12 @@ pub const Executor = struct {
         const new_ndim = input.shape.len + num_axes;
         var new_shape: [16]i64 = undefined;
 
-        // Normalize negative axes
+        // Normalize negative axes and validate
         var sorted_axes: [16]usize = undefined;
         for (0..num_axes) |i| {
             const axis = axes_buf[i];
             const norm: usize = if (axis < 0) @intCast(@as(i64, @intCast(new_ndim)) + axis) else @intCast(axis);
+            if (norm >= new_ndim) return error.InvalidAxis;
             sorted_axes[i] = norm;
         }
 
