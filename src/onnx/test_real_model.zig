@@ -173,8 +173,8 @@ test "run speech_encoder_q4.onnx" {
     const input_shape = [_]i64{ 1, 16000 };
     try exec.setInputFromSlice(input_name, f32, input_data, &input_shape);
 
-    // Run
-    exec.run() catch |err| {
+    // Run with debug tracing
+    exec.runDebug() catch |err| {
         std.debug.print("Execution failed: {}\n", .{err});
         return err;
     };

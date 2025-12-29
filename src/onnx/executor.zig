@@ -814,9 +814,9 @@ pub const Executor = struct {
         }
     }
 
-    /// Execute all nodes with debug output
+    /// Execute all nodes with debug output on error
     pub fn runDebug(self: *Executor) !void {
-        // Same dependency logic as run(), but with debug output
+        // Same dependency logic as run(), but keeps history for debug on error
         const nodes = self.graph.nodes.items;
         const n = nodes.len;
 
@@ -839,6 +839,12 @@ pub const Executor = struct {
         var executed = try self.allocator.alloc(bool, n);
         defer self.allocator.free(executed);
         @memset(executed, false);
+
+        // Ring buffer for last 20 executed nodes
+        const HistorySize = 20;
+        var history: [HistorySize]usize = undefined;
+        var history_idx: usize = 0;
+        var history_count: usize = 0;
 
         var exec_order: usize = 0;
         var remaining = n;
@@ -863,45 +869,57 @@ pub const Executor = struct {
                 }
 
                 if (ready) {
-                    // Print debug info before execution
-                    std.debug.print("[{d}] {s}", .{ exec_order, @tagName(node.op_type) });
-                    std.debug.print(" inputs: ", .{});
-                    for (node.inputs, 0..) |inp_idx, j| {
-                        if (j > 0) std.debug.print(", ", .{});
-                        if (self.buffers[inp_idx]) |buf| {
-                            std.debug.print("[", .{});
-                            for (buf.shape, 0..) |dim, k| {
-                                if (k > 0) std.debug.print(",", .{});
-                                std.debug.print("{}", .{dim});
+                    self.executeNode(node) catch |err| {
+                        // Print history of last N nodes before error
+                        std.debug.print("\n=== Error at node {} ({s}) after {} successful executions ===\n", .{
+                            i,
+                            @tagName(node.op_type),
+                            exec_order,
+                        });
+
+                        // Print node name if available
+                        if (node.name) |name| {
+                            std.debug.print("Node name: {s}\n", .{name});
+                        }
+
+                        std.debug.print("\nLast {} nodes executed:\n", .{@min(history_count, HistorySize)});
+                        const start = if (history_count >= HistorySize) history_idx else 0;
+                        const count = @min(history_count, HistorySize);
+                        for (0..count) |j| {
+                            const idx = (start + j) % HistorySize;
+                            const hist_node_idx = history[idx];
+                            const hist_node = nodes[hist_node_idx];
+                            std.debug.print("  [{d}] Node {} ({s}): ", .{ exec_order - count + j, hist_node_idx, @tagName(hist_node.op_type) });
+                            for (hist_node.outputs) |out_idx| {
+                                if (self.buffers[out_idx]) |buf| {
+                                    std.debug.print("-> {any} ", .{buf.shape});
+                                }
                             }
-                            std.debug.print("]", .{});
-                        } else {
+                            if (hist_node.name) |name| {
+                                std.debug.print("({s})", .{name});
+                            }
+                            std.debug.print("\n", .{});
+                        }
+
+                        std.debug.print("\nFailing node inputs:\n", .{});
+                        for (node.inputs, 0..) |inp_idx, j| {
                             const name = if (inp_idx < self.graph.tensors.items.len)
                                 self.graph.tensors.items[inp_idx].name
                             else
                                 "?";
-                            std.debug.print("null({s})", .{name});
-                        }
-                    }
-
-                    try self.executeNode(node);
-
-                    // Print output shapes
-                    std.debug.print(" -> ", .{});
-                    for (node.outputs, 0..) |out_idx, j| {
-                        if (j > 0) std.debug.print(", ", .{});
-                        if (self.buffers[out_idx]) |buf| {
-                            std.debug.print("[", .{});
-                            for (buf.shape, 0..) |dim, k| {
-                                if (k > 0) std.debug.print(",", .{});
-                                std.debug.print("{}", .{dim});
+                            if (self.buffers[inp_idx]) |buf| {
+                                std.debug.print("  Input {}: {s} shape={any}\n", .{ j, name, buf.shape });
+                            } else {
+                                std.debug.print("  Input {}: {s} = null\n", .{ j, name });
                             }
-                            std.debug.print("]", .{});
-                        } else {
-                            std.debug.print("null", .{});
                         }
-                    }
-                    std.debug.print("\n", .{});
+                        return err;
+                    };
+
+                    // Record in history
+                    history[history_idx] = i;
+                    history_idx = (history_idx + 1) % HistorySize;
+                    if (history_count < HistorySize) history_count += 1;
 
                     executed[i] = true;
                     remaining -= 1;
@@ -932,7 +950,7 @@ pub const Executor = struct {
     }
 
     /// Execute a single node
-    fn executeNode(self: *Executor, node: Node) !void {
+    pub fn executeNode(self: *Executor, node: Node) !void {
         switch (node.op_type) {
             .Add => try self.execBinaryOp(node, .add),
             .Sub => try self.execBinaryOp(node, .sub),
@@ -2972,15 +2990,33 @@ pub const Executor = struct {
         const input = self.buffers[node.inputs[0]] orelse return error.MissingInput;
         const output_idx = node.outputs[0];
 
-        // Get reduce attributes
-        const attrs = node.attributes.reduce;
-        const keepdims = attrs.keepdims;
+        // Get reduce attributes (if present)
+        const has_reduce_attrs = node.attributes == .reduce;
+        const keepdims = if (has_reduce_attrs) node.attributes.reduce.keepdims else true;
+        const noop_with_empty_axes = if (has_reduce_attrs) node.attributes.reduce.noop_with_empty_axes else false;
 
-        // Get axes from attributes or second input
-        var axes_to_reduce: []const i64 = attrs.axes orelse &.{};
+        // Get axes from attributes or second input (ONNX opset 13+)
+        var axes_to_reduce: []const i64 = if (has_reduce_attrs)
+            node.attributes.reduce.axes orelse &.{}
+        else
+            &.{};
+
+        // Check for axes as second input (opset 13+)
+        var axes_from_input_buf: [8]i64 = undefined;
+        if (axes_to_reduce.len == 0 and node.inputs.len > 1) {
+            if (self.buffers[node.inputs[1]]) |axes_tensor| {
+                if (axes_tensor.dtype == .i64) {
+                    if (axes_tensor.asConstSlice(i64)) |axes_data| {
+                        const count = @min(axes_data.len, 8);
+                        @memcpy(axes_from_input_buf[0..count], axes_data[0..count]);
+                        axes_to_reduce = axes_from_input_buf[0..count];
+                    }
+                }
+            }
+        }
 
         // If axes empty and noop_with_empty_axes, just copy input
-        if (axes_to_reduce.len == 0 and attrs.noop_with_empty_axes) {
+        if (axes_to_reduce.len == 0 and noop_with_empty_axes) {
             var output = try RuntimeTensor.alloc(self.allocator, input.dtype, input.shape);
             @memcpy(output.data, input.data);
             if (self.buffers[output_idx]) |*existing| {
@@ -4038,11 +4074,13 @@ pub const Executor = struct {
         const input = self.buffers[node.inputs[0]] orelse return error.MissingInput;
         const output_idx = node.outputs[0];
 
-        // Get reduction axes
+        // Get reduction axes from attributes or second input (opset 13+)
         var axes_buf: [16]i64 = undefined;
         var num_axes: usize = 0;
         var keepdims: bool = true;
+        var noop_with_empty_axes: bool = false;
 
+        // First try attributes
         switch (node.attributes) {
             .reduce => |attrs| {
                 if (attrs.axes) |axes| {
@@ -4050,12 +4088,32 @@ pub const Executor = struct {
                     for (axes, 0..) |a, i| axes_buf[i] = a;
                 }
                 keepdims = attrs.keepdims;
+                noop_with_empty_axes = attrs.noop_with_empty_axes;
             },
             else => {},
         }
 
+        // Then check for axes as second input (opset 13+)
+        if (num_axes == 0 and node.inputs.len > 1) {
+            if (self.buffers[node.inputs[1]]) |axes_tensor| {
+                if (axes_tensor.asConstSlice(i64)) |axes| {
+                    num_axes = @min(axes.len, 16);
+                    for (axes[0..num_axes], 0..) |a, i| axes_buf[i] = a;
+                }
+            }
+        }
+
+        // If axes still empty and noop_with_empty_axes, just copy input
+        if (num_axes == 0 and noop_with_empty_axes) {
+            var output = try RuntimeTensor.alloc(self.allocator, input.dtype, input.shape);
+            @memcpy(output.data, input.data);
+            if (self.buffers[output_idx]) |*existing| existing.deinit();
+            self.buffers[output_idx] = output;
+            return;
+        }
+
         if (num_axes == 0) {
-            // Reduce all dimensions
+            // Reduce all dimensions (default when no axes specified)
             num_axes = input.shape.len;
             for (0..num_axes) |i| axes_buf[i] = @intCast(i);
         }
@@ -4306,6 +4364,7 @@ pub const Executor = struct {
         var num_axes: usize = 0;
         var keepdims: bool = true;
 
+        // First try attributes
         switch (node.attributes) {
             .reduce => |attrs| {
                 if (attrs.axes) |axes| {
@@ -4315,6 +4374,16 @@ pub const Executor = struct {
                 keepdims = attrs.keepdims;
             },
             else => {},
+        }
+
+        // Then check for axes as second input (opset 13+)
+        if (num_axes == 0 and node.inputs.len > 1) {
+            if (self.buffers[node.inputs[1]]) |axes_tensor| {
+                if (axes_tensor.asConstSlice(i64)) |axes| {
+                    num_axes = @min(axes.len, 16);
+                    for (axes[0..num_axes], 0..) |a, i| axes_buf[i] = a;
+                }
+            }
         }
 
         if (num_axes == 0) {
